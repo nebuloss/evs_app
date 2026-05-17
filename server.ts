@@ -20,6 +20,7 @@ import path from 'path'
 import { URL } from 'url'
 
 const app = express()
+app.set('trust proxy', 1)
 const PORT = Number(process.env.PORT ?? 3000)
 const DEV_PORT = 3001
 

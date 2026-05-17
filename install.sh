@@ -127,6 +127,8 @@ depend() {
 start_pre() {
     export PORT=$APP_PORT
     export NODE_ENV=production
+    touch /var/log/\${RC_SVCNAME}.log
+    chown $APP_USER /var/log/\${RC_SVCNAME}.log
 }
 EOF
     chmod +x "/etc/init.d/$SERVICE_NAME"

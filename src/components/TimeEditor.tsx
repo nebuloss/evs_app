@@ -69,6 +69,7 @@ export default function TimeEditor({ initial, onSave, onCancel }: Props) {
           {DAYS.map(d => (
             <button
               key={d.iso}
+              type="button"
               onClick={() => toggleDay(d.iso)}
               className={cn(
                 'flex-1 py-2 rounded-lg text-xs font-semibold border transition-colors',
@@ -117,6 +118,7 @@ export default function TimeEditor({ initial, onSave, onCancel }: Props) {
                 />
                 {windows.length > 1 && (
                   <button
+                    type="button"
                     onClick={() => removeWindow(i)}
                     className="text-slate-400 dark:text-slate-500 hover:text-red-500 text-lg leading-none"
                   >
@@ -126,6 +128,7 @@ export default function TimeEditor({ initial, onSave, onCancel }: Props) {
               </div>
             ))}
             <button
+              type="button"
               onClick={addWindow}
               className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline font-medium"
             >
