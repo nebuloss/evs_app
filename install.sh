@@ -105,23 +105,28 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null \
 install_service_alpine() {
     info "Installing OpenRC service…"
     rc-service "$SERVICE_NAME" stop 2>/dev/null || true
+    NODE_BIN=$(which node)
     cat > "/etc/init.d/$SERVICE_NAME" << EOF
 #!/sbin/openrc-run
 
 name="$SERVICE_NAME"
 description="EVS Slot Finder App"
-command="node"
+command="$NODE_BIN"
 command_args="$APP_DIR/dist-server/server.js"
 command_user="$APP_USER"
 command_background=yes
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/\${RC_SVCNAME}.log"
 error_log="/var/log/\${RC_SVCNAME}.log"
-environment="PORT=$APP_PORT NODE_ENV=production"
 
 depend() {
     need net
     after firewall
+}
+
+start_pre() {
+    export PORT=$APP_PORT
+    export NODE_ENV=production
 }
 EOF
     chmod +x "/etc/init.d/$SERVICE_NAME"
