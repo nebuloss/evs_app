@@ -9,7 +9,6 @@
 set -eu
 
 # ── Configuration (override via env) ─────────────────────────────────────────
-GIT_REPO="${GIT_REPO:-https://github.com/your-user/evs-app.git}"
 APP_DIR="${APP_DIR:-/opt/evs-app}"
 APP_USER="${APP_USER:-evs}"
 APP_PORT="${APP_PORT:-3000}"
@@ -43,7 +42,7 @@ info "Detected OS: $OS"
 install_packages_alpine() {
     info "Installing packages (Alpine)…"
     apk update -q
-    apk add --no-cache git curl ca-certificates
+    apk add --no-cache curl ca-certificates
 
     # Node.js: Alpine 3.19+ ships Node 20, 3.20+ ships Node 22
     ALPINE_VER=$(cat /etc/alpine-release | cut -d. -f1,2)
@@ -62,7 +61,7 @@ install_packages_debian() {
     info "Installing packages (Debian/Ubuntu)…"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq curl ca-certificates git
+    apt-get install -y -qq curl ca-certificates
 
     # NodeSource — installs requested major version
     info "Installing Node.js ${NODE_VERSION}.x via NodeSource…"
@@ -86,24 +85,17 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
     esac
 fi
 
-# ── Clone or update repository ────────────────────────────────────────────────
-if [ -d "$APP_DIR/.git" ]; then
-    info "Updating existing repository in $APP_DIR…"
-    git -C "$APP_DIR" fetch --quiet origin
-    git -C "$APP_DIR" reset --hard origin/master --quiet 2>/dev/null \
-        || git -C "$APP_DIR" reset --hard origin/main --quiet
-else
-    info "Cloning $GIT_REPO → $APP_DIR…"
-    git clone --depth 1 --quiet "$GIT_REPO" "$APP_DIR"
-fi
+# ── Download pre-built release ────────────────────────────────────────────────
+RELEASE_URL="https://github.com/nebuloss/evs_app/releases/latest/download/evs-app.tar.gz"
+info "Downloading latest release…"
+rm -rf "$APP_DIR/dist" "$APP_DIR/dist-server"
+mkdir -p "$APP_DIR"
+curl -fsSL "$RELEASE_URL" | tar -xz -C "$APP_DIR"
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-info "Installing npm dependencies…"
+# ── Install production dependencies ───────────────────────────────────────────
+info "Installing production dependencies…"
 cd "$APP_DIR"
-npm ci --prefer-offline --quiet 2>&1 | tail -3 || npm install --quiet 2>&1 | tail -3
-
-info "Building application…"
-npm run build 2>&1 | tail -5
+npm ci --omit=dev --prefer-offline --quiet 2>&1 | tail -3
 
 # ── Set ownership ─────────────────────────────────────────────────────────────
 chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null \
@@ -112,6 +104,7 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null \
 # ── Install service ───────────────────────────────────────────────────────────
 install_service_alpine() {
     info "Installing OpenRC service…"
+    rc-service "$SERVICE_NAME" stop 2>/dev/null || true
     cat > "/etc/init.d/$SERVICE_NAME" << EOF
 #!/sbin/openrc-run
 
@@ -124,24 +117,21 @@ command_background=yes
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/\${RC_SVCNAME}.log"
 error_log="/var/log/\${RC_SVCNAME}.log"
+environment="PORT=$APP_PORT NODE_ENV=production"
 
 depend() {
     need net
     after firewall
 }
-
-start_pre() {
-    export PORT=$APP_PORT
-    export NODE_ENV=production
-}
 EOF
     chmod +x "/etc/init.d/$SERVICE_NAME"
     rc-update add "$SERVICE_NAME" default 2>/dev/null || true
-    rc-service "$SERVICE_NAME" restart 2>/dev/null || rc-service "$SERVICE_NAME" start
+    rc-service "$SERVICE_NAME" start
 }
 
 install_service_systemd() {
     info "Installing systemd service…"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     cat > "/etc/systemd/system/$SERVICE_NAME.service" << EOF
 [Unit]
 Description=EVS Slot Finder App
@@ -151,7 +141,7 @@ After=network.target
 Type=simple
 User=$APP_USER
 WorkingDirectory=$APP_DIR
-ExecStart=/usr/bin/node $APP_DIR/dist-server/server.js
+ExecStart=$(which node) $APP_DIR/dist-server/server.js
 Restart=on-failure
 RestartSec=5s
 Environment=NODE_ENV=production
@@ -162,7 +152,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
-    systemctl restart "$SERVICE_NAME"
+    systemctl start "$SERVICE_NAME"
 }
 
 case "$OS" in
