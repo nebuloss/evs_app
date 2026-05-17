@@ -90,6 +90,10 @@ RELEASE_URL="https://github.com/nebuloss/evs_app/releases/latest/download/evs-ap
 info "Downloading latest release…"
 rm -rf "$APP_DIR/dist" "$APP_DIR/dist-server"
 mkdir -p "$APP_DIR"
+APP_VERSION=$(curl -fsSL "https://api.github.com/repos/nebuloss/evs_app/releases/latest" \
+    | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+APP_VERSION="${APP_VERSION:-unknown}"
+info "Installing version ${APP_VERSION}…"
 curl -fsSL "$RELEASE_URL" | tar -xz -C "$APP_DIR"
 
 # ── Install production dependencies ───────────────────────────────────────────
@@ -169,7 +173,7 @@ esac
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 info ""
-info "✓ EVS App deployed successfully!"
+info "✓ EVS App ${APP_VERSION} deployed successfully!"
 info "  URL:     http://localhost:$APP_PORT"
 info "  Dir:     $APP_DIR"
 info "  User:    $APP_USER"
