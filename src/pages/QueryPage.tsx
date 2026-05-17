@@ -193,7 +193,7 @@ export default function QueryPage() {
         updateStructure(snapshot, discovered, new Date())
       }
 
-      const stale = stalePairs(snapshot, 1)
+      const stale = [...stalePairs(snapshot, 1)]
       for (let i = 0; i < stale.length; i++) {
         const pairKey = stale[i]
         const [locId, teacherId] = pairKey.split(':')
