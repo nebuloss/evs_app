@@ -83,8 +83,10 @@ Default port is **3000**. Override with the `PORT` environment variable.
 A single-command install script handles Node.js installation, building, and service setup on Alpine (OpenRC) and Debian/Ubuntu (systemd):
 
 ```bash
-GIT_REPO=https://github.com/nebuloss/evs-app.git bash install.sh
+curl -fsSL https://raw.githubusercontent.com/nebuloss/evs_app/refs/heads/master/install.sh | bash
 ```
+
+The app will be available on **http://localhost:3000** — point Nginx Proxy Manager (or any reverse proxy) at that port.
 
 See [docs/deployment.md](docs/deployment.md) for full details including Docker, Nginx/Caddy reverse proxy, and service management commands.
 
