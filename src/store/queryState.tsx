@@ -1,13 +1,20 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from 'react'
 import type { Slot } from '@/core/snapshot'
-import type { PlaceProfile, TimeProfile } from '@/store/config'
 import type { Gearbox } from '@/core/search'
 
+/** A picked location (ad-hoc, not necessarily a saved profile). */
+export interface GeoPoint { name: string; lat: number; lng: number }
+
 export interface QueryState {
-  place: PlaceProfile | null
-  time: TimeProfile | null
+  place: GeoPoint | null
+  radiusKm: number
   gearbox: Gearbox
   minRating: number
+  /** ISO weekdays 1=Mon…7=Sun; empty = any day. */
+  days: number[]
+  anyTime: boolean
+  tStart: string  // "HH:MM"
+  tEnd: string
   /** Null means no query has been run yet; empty array means query ran but returned nothing. */
   results: Slot[] | null
   snapshotInfo: { slots: number; fetchedAt: string | null } | null
@@ -18,9 +25,13 @@ export interface QueryState {
 
 const defaultState: QueryState = {
   place: null,
-  time: null,
+  radiusKm: 20,
   gearbox: 'bvm',
   minRating: 0,
+  days: [],
+  anyTime: true,
+  tStart: '07:00',
+  tEnd: '09:00',
   results: null,
   snapshotInfo: null,
   error: null,

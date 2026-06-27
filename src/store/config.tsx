@@ -160,13 +160,11 @@ function makeAccountsStore() {
       writeLocal('evs_accounts', next)
       return next
     })
-    // Auto-select the first real account ever added; anonymous accounts are never auto-selected.
+    // Explicitly adding/saving a real account selects it (so the 2nd, 3rd… account
+    // you add actually becomes active). Anonymous accounts are never auto-selected.
     if (!a.anonymous) {
-      setActiveNameState(prev => {
-        if (prev) return prev
-        writeLocal('evs_active_account', a.name)
-        return a.name
-      })
+      setActiveNameState(a.name)
+      writeLocal('evs_active_account', a.name)
     }
   }
 
@@ -255,6 +253,21 @@ function makeThemeStore() {
   return { theme, setTheme, toggleTheme }
 }
 
+/** App settings. cacheTtlMin = how long cached availability slots are reused before
+ *  re-querying EVS (0 = always refetch). Mirrors the search prototype's setting. */
+function makeSettingsStore() {
+  const [cacheTtlMin, setCacheTtlMinState] = useState<number>(() => {
+    const v = Number(readLocal<number>('evs_cache_ttl_min', 60))
+    return Number.isFinite(v) && v >= 0 ? v : 60
+  })
+  const setCacheTtlMin = useCallback((v: number) => {
+    const n = Math.max(0, Math.round(v) || 0)
+    setCacheTtlMinState(n)
+    writeLocal('evs_cache_ttl_min', n)
+  }, [])
+  return { cacheTtlMin, setCacheTtlMin }
+}
+
 // ── Contexts ──────────────────────────────────────────────────────────────────
 
 type PlacesStore = ReturnType<typeof makePlacesStore>
@@ -262,12 +275,14 @@ type TimesStore = ReturnType<typeof makeTimesStore>
 type AccountsStore = ReturnType<typeof makeAccountsStore>
 type WishlistStore = ReturnType<typeof makeWishlistStore>
 type ThemeStore = ReturnType<typeof makeThemeStore>
+type SettingsStore = ReturnType<typeof makeSettingsStore>
 
 const PlacesCtx = createContext<PlacesStore | null>(null)
 const TimesCtx = createContext<TimesStore | null>(null)
 const AccountsCtx = createContext<AccountsStore | null>(null)
 const WishlistCtx = createContext<WishlistStore | null>(null)
 const ThemeCtx = createContext<ThemeStore | null>(null)
+const SettingsCtx = createContext<SettingsStore | null>(null)
 
 // ── Provider ──────────────────────────────────────────────────────────────────
 
@@ -277,18 +292,21 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   const accounts = makeAccountsStore()
   const wishlist = makeWishlistStore()
   const theme = makeThemeStore()
+  const settings = makeSettingsStore()
 
   return (
     <ThemeCtx.Provider value={theme}>
-      <PlacesCtx.Provider value={places}>
-        <TimesCtx.Provider value={times}>
-          <AccountsCtx.Provider value={accounts}>
-            <WishlistCtx.Provider value={wishlist}>
-              {children}
-            </WishlistCtx.Provider>
-          </AccountsCtx.Provider>
-        </TimesCtx.Provider>
-      </PlacesCtx.Provider>
+      <SettingsCtx.Provider value={settings}>
+        <PlacesCtx.Provider value={places}>
+          <TimesCtx.Provider value={times}>
+            <AccountsCtx.Provider value={accounts}>
+              <WishlistCtx.Provider value={wishlist}>
+                {children}
+              </WishlistCtx.Provider>
+            </AccountsCtx.Provider>
+          </TimesCtx.Provider>
+        </PlacesCtx.Provider>
+      </SettingsCtx.Provider>
     </ThemeCtx.Provider>
   )
 }
@@ -325,6 +343,12 @@ export function useTheme(): ThemeStore {
   return ctx
 }
 
+export function useSettings(): SettingsStore {
+  const ctx = useContext(SettingsCtx)
+  if (!ctx) throw new Error('useSettings must be inside ConfigProvider')
+  return ctx
+}
+
 // ── Wishlist key helpers ──────────────────────────────────────────────────────
 
 /** Stable identity key for a wishlist slot: `startsAtUtc::teacherId`. */
@@ -333,3 +357,21 @@ export type WishlistKey = string
 export function wishlistKey(slot: Slot): WishlistKey {
   return `${slot.startsAtUtc}::${slot.teacherId}`
 }
+
+// ── Recent searches + last search (localStorage; no context needed) ────────────
+
+/** A complete ad-hoc search the user ran — saved so it can be repeated in one tap. */
+export interface RecentSearch {
+  place: PlaceProfile           // { name, lat, lng, radius_km }
+  gearbox: 'bvm' | 'bva'
+  minRating: number
+  days: number[]                // ISO weekdays; empty = any
+  anyTime: boolean
+  tStart: string                // "HH:MM"
+  tEnd: string
+}
+
+export function loadRecents(): RecentSearch[] { return readLocal<RecentSearch[]>('evs_recent', []) }
+export function saveRecents(r: RecentSearch[]): void { writeLocal('evs_recent', r) }
+export function loadLastSearch(): RecentSearch | null { return readLocal<RecentSearch | null>('evs_last_search', null) }
+export function saveLastSearch(r: RecentSearch): void { writeLocal('evs_last_search', r) }

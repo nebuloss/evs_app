@@ -18,7 +18,6 @@
 import type { Gearbox } from '@/core/search'
 import type { PairMeta, Slot } from '@/core/snapshot'
 import { haversineKm, type Point } from '@/core/geo'
-import { mapLimit } from '@/lib/utils'
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -281,8 +280,8 @@ export class EVSClient {
     onProgress?: (found: number, queries: number) => void,
   ): Promise<{ points: MeetingPoint[]; queries: number; truncated: boolean }> {
     const CAP = 20            // backend hard cap on points per query
-    const CONCURRENCY = 8     // verified safe; ~5x faster than sequential
-    const MAX_QUERIES = 400   // safety bound on a single discovery
+    const CONCURRENCY = 16    // measured sweet spot; endpoint throttles past this
+    const MAX_QUERIES = 500   // safety bound on a single discovery
     const MIN_CELL_KM = 0.4   // stop subdividing below this to avoid runaway recursion
 
     interface Cell { minLat: number; maxLat: number; minLng: number; maxLng: number }
@@ -309,47 +308,44 @@ export class EVSClient {
 
     const found = new Map<string, MeetingPoint>()
     let queries = 0
+    let active = 0
     let truncated = false
-    let level: Cell[] = [{ minLat: center.lat - dLat, maxLat: center.lat + dLat, minLng: center.lng - dLng, maxLng: center.lng + dLng }]
+    const queue: Cell[] = [{ minLat: center.lat - dLat, maxLat: center.lat + dLat, minLng: center.lng - dLng, maxLng: center.lng + dLng }]
 
-    while (level.length > 0) {
-      const active = level.filter(c => intersectsDisc(c) && !isCovered(c))
-      if (active.length === 0) break
-      if (queries + active.length > MAX_QUERIES) { truncated = true; break }
-
-      const batch = await mapLimit(active, CONCURRENCY, async cell => {
-        const q = cellCenter(cell)
-        const pts = await this.getMeetingPoints(q.lat, q.lng, gearbox)
-        return { cell, q, pts }
-      })
-      queries += active.length
-
-      const next: Cell[] = []
-      for (const { cell, q, pts } of batch) {
-        for (const p of pts) found.set(p.id, p)
-        // Record the proven coverage disc: we know every point within the farthest
-        // returned distance (when capped) — exactly the radius we can safely skip.
-        if (pts.length > 0) covered.push({ q, cov: Math.max(...pts.map(p => haversineKm(q, p))) })
-        if (pts.length >= CAP) {
-          // We reliably know all points within `coverage` of q; subdivide if the
-          // cell still reaches past that (and isn't already tiny).
-          const coverage = Math.max(...pts.map(p => haversineKm(q, p)))
-          const halfDiag = Math.max(...corners(cell).map(k => haversineKm(q, k)))
-          if (halfDiag > coverage && halfDiag > MIN_CELL_KM) {
-            const mLat = (cell.minLat + cell.maxLat) / 2
-            const mLng = (cell.minLng + cell.maxLng) / 2
-            next.push(
-              { minLat: cell.minLat, maxLat: mLat, minLng: cell.minLng, maxLng: mLng },
-              { minLat: cell.minLat, maxLat: mLat, minLng: mLng, maxLng: cell.maxLng },
-              { minLat: mLat, maxLat: cell.maxLat, minLng: cell.minLng, maxLng: mLng },
-              { minLat: mLat, maxLat: cell.maxLat, minLng: mLng, maxLng: cell.maxLng },
-            )
-          }
+    // Continuous work-pool: keep CONCURRENCY queries in flight at all times,
+    // subdividing on the fly — no per-level barrier idle (much faster than BFS).
+    await new Promise<void>(resolve => {
+      const pump = (): void => {
+        if (queue.length === 0 && active === 0) return resolve()
+        while (active < CONCURRENCY && queue.length > 0 && queries < MAX_QUERIES) {
+          const cell = queue.shift()!
+          if (!intersectsDisc(cell) || isCovered(cell)) continue
+          active++; queries++
+          const q = cellCenter(cell)
+          this.getMeetingPoints(q.lat, q.lng, gearbox).then(pts => {
+            for (const p of pts) found.set(p.id, p)
+            if (pts.length > 0) covered.push({ q, cov: Math.max(...pts.map(p => haversineKm(q, p))) })
+            if (pts.length >= CAP) {
+              const coverage = Math.max(...pts.map(p => haversineKm(q, p)))
+              const halfDiag = Math.max(...corners(cell).map(k => haversineKm(q, k)))
+              if (halfDiag > coverage && halfDiag > MIN_CELL_KM) {
+                const mLat = (cell.minLat + cell.maxLat) / 2
+                const mLng = (cell.minLng + cell.maxLng) / 2
+                queue.push(
+                  { minLat: cell.minLat, maxLat: mLat, minLng: cell.minLng, maxLng: mLng },
+                  { minLat: cell.minLat, maxLat: mLat, minLng: mLng, maxLng: cell.maxLng },
+                  { minLat: mLat, maxLat: cell.maxLat, minLng: cell.minLng, maxLng: mLng },
+                  { minLat: mLat, maxLat: cell.maxLat, minLng: mLng, maxLng: cell.maxLng },
+                )
+              }
+            }
+            onProgress?.(found.size, queries)
+          }).catch(() => {}).finally(() => { active--; pump() })
         }
+        if (queries >= MAX_QUERIES && queue.length > 0) truncated = true
       }
-      onProgress?.(found.size, queries)
-      level = next
-    }
+      pump()
+    })
 
     return { points: [...found.values()], queries, truncated }
   }

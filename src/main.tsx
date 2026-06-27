@@ -17,6 +17,14 @@ L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, 
 
 const queryClient = new QueryClient()
 
+// Register the service worker so the app is installable (PWA) on mobile/desktop.
+// Requires a secure context (HTTPS or localhost) — works once deployed behind HTTPS.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.warn('SW registration failed:', err))
+  })
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ErrorBoundary>

@@ -2,16 +2,15 @@ import { useRef, useState, useEffect } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { Search, Heart, User, Settings, ChevronDown, Check, Plus, Trash2, Sun, Moon } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { useAccounts, useTheme, type Account } from '@/store/config'
+import { useAccounts, useTheme, useSettings, type Account } from '@/store/config'
 import { evsClient } from '@/api/evs'
 import AccountModal from '@/components/AccountModal'
 import { useEscapeKey, useEnterKey } from '@/hooks/useKeyShortcuts'
 
 const navItems = [
-  { to: '/query',    label: 'Query',    Icon: Search   },
-  { to: '/wishlist', label: 'Wishlist', Icon: Heart    },
-  { to: '/account',  label: 'Account',  Icon: User     },
-  { to: '/settings', label: 'Settings', Icon: Settings },
+  { to: '/query',    label: 'Search',   Icon: Search },
+  { to: '/wishlist', label: 'Wishlist', Icon: Heart  },
+  { to: '/account',  label: 'Account',  Icon: User   },
 ]
 
 // ── Confirm delete modal ───────────────────────────────────────────────────────
@@ -75,6 +74,51 @@ function ThemeToggle() {
         {theme === 'dark' ? 'Light' : 'Dark'}
       </span>
     </button>
+  )
+}
+
+// ── Settings menu (cache expiration) ───────────────────────────────────────────
+
+function SettingsMenu() {
+  const { cacheTtlMin, setCacheTtlMin } = useSettings()
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', h)
+    return () => document.removeEventListener('mousedown', h)
+  }, [open])
+  const presets: Array<[string, number]> = [['Off', 0], ['15 min', 15], ['1 h', 60], ['1 day', 1440]]
+  return (
+    <div className="relative" ref={ref}>
+      <button onClick={() => setOpen(o => !o)} title="Settings"
+        className="rounded-xl px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors">
+        <Settings size={18} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-2rem)] rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-xl z-50 p-4 text-slate-700 dark:text-slate-200">
+          <p className="text-sm font-semibold mb-1">Cache expiration</p>
+          <p className="text-[11px] text-slate-400 dark:text-slate-500 mb-3">Reuse saved results without re-querying EVS for this long.</p>
+          <div className="flex items-center gap-2">
+            <input type="number" min={0} value={cacheTtlMin}
+              onChange={e => setCacheTtlMin(Number(e.target.value))}
+              className="w-24 rounded-lg border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-700 px-2 py-1.5 text-sm" />
+            <span className="text-sm text-slate-500 dark:text-slate-400">minutes</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5 mt-3">
+            {presets.map(([l, v]) => (
+              <button key={v} onClick={() => setCacheTtlMin(v)}
+                className={cn('rounded-lg border px-2.5 py-1 text-xs transition-colors',
+                  cacheTtlMin === v ? 'border-indigo-500 text-indigo-600 dark:text-indigo-400' : 'border-slate-200 dark:border-slate-600 hover:border-indigo-400')}>
+                {l}
+              </button>
+            ))}
+          </div>
+          <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-2"><b>0</b> = always fetch fresh from EVS.</p>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -279,6 +323,7 @@ export default function Layout() {
           <span className="md:hidden text-base font-bold text-white mr-auto">🚗 EVS</span>
           {/* Desktop spacer to push controls right */}
           <div className="hidden md:block flex-1" />
+          <SettingsMenu />
           <ThemeToggle />
           <AccountSwitcher />
         </header>
