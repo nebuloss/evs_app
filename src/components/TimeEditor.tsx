@@ -28,7 +28,7 @@ export default function TimeEditor({ initial, onSave, onCancel }: Props) {
 
   const toggleDay = (iso: number) =>
     setWeekdays(prev =>
-      prev.includes(iso) ? prev.filter(d => d !== iso) : [...prev, iso].sort(),
+      prev.includes(iso) ? prev.filter(d => d !== iso) : [...prev, iso].sort((a, b) => a - b),
     )
 
   const updateWindow = (i: number, field: 'start' | 'end', val: string) =>

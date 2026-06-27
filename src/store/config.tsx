@@ -50,8 +50,22 @@ function readLocal<T>(key: string, fallback: T): T {
   } catch { return fallback }
 }
 
-function writeLocal<T>(key: string, value: T): void {
-  localStorage.setItem(key, JSON.stringify(value))
+/**
+ * Persists a value to localStorage. Returns false (instead of throwing) when the
+ * write fails — e.g. iOS Safari Private Browsing, which throws QuotaExceededError
+ * on every setItem, or storage eviction under memory pressure. Because these
+ * writers run inside React state updaters, an uncaught throw here would tear down
+ * the whole component tree (blank screen); swallowing it keeps the in-memory state
+ * usable for the session even when it can't be persisted.
+ */
+function writeLocal<T>(key: string, value: T): boolean {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+    return true
+  } catch (err) {
+    console.warn(`Failed to persist "${key}" to localStorage:`, err)
+    return false
+  }
 }
 
 // ── Store factories ───────────────────────────────────────────────────────────

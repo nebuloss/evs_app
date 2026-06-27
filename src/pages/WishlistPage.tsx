@@ -53,7 +53,7 @@ export default function WishlistPage() {
       remove(key)
       setSuccessSlotKey(key)
       setBookingSlot(null)
-      queryClient.invalidateQueries({ queryKey: ['profile', studentId] })
+      queryClient.invalidateQueries({ queryKey: ['profile', activeAccount.name, studentId] })
     } catch (err) {
       setBookingError((err as Error).message)
     } finally {
@@ -61,19 +61,9 @@ export default function WishlistPage() {
     }
   }
 
-  if (!activeAccount) {
-    return (
-      <div className="max-w-2xl mx-auto px-6 py-16 text-center space-y-4">
-        <p className="text-slate-500 dark:text-slate-400">No account configured.</p>
-        <button
-          onClick={() => navigate('/settings')}
-          className="rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-5 py-2.5"
-        >
-          Go to Settings
-        </button>
-      </div>
-    )
-  }
+  // The wishlist is always viewable, even with no real account configured
+  // (e.g. anonymous browsing). Only *booking* requires a real, credited account,
+  // which is gated separately by the disabled "Book" button and handleConfirm.
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8 space-y-6">

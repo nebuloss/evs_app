@@ -17,6 +17,8 @@
 
 import type { Gearbox } from '@/core/search'
 import type { PairMeta, Slot } from '@/core/snapshot'
+import { haversineKm, type Point } from '@/core/geo'
+import { mapLimit } from '@/lib/utils'
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -37,6 +39,9 @@ export interface MeetingPoint {
   name: string
   lat: number
   lng: number
+  /** ISO datetime of the next free slot, or null if the point has no upcoming
+   *  availability. Null points are skipped before fetching teachers/slots. */
+  nextAvailability: string | null
 }
 
 export interface Teacher {
@@ -248,8 +253,105 @@ export class EVSClient {
     const qs = new URLSearchParams({ latitude: lat.toString(), longitude: lng.toString(), gearbox_type: gearbox })
     const res = await this.request('GET', `/api/v3/availabilities?${qs}`)
     if (!res.ok) throw new Error('Failed to get meeting points')
-    const data = await res.json() as { data: Array<{ id: string; name: string; latitude: number; longitude: number }> }
-    return data.data.map(p => ({ id: p.id, name: p.name, lat: p.latitude, lng: p.longitude }))
+    const data = await res.json() as { data: Array<{ id: string; name: string; latitude: number; longitude: number; next_availability: string | null }> }
+    return data.data.map(p => ({ id: p.id, name: p.name, lat: p.latitude, lng: p.longitude, nextAvailability: p.next_availability ?? null }))
+  }
+
+  /**
+   * Discovers ALL meeting points within `radiusKm` of `center`.
+   *
+   * Why this is non-trivial: the `/availabilities` endpoint ignores any radius
+   * parameter and only ever returns the ~20 NEAREST points to the queried
+   * coordinate (in dense areas like central Paris those 20 are all within ~4km).
+   * A single query therefore can't cover a 20km radius — searching Paris vs
+   * Clamart (9km apart) returns two completely disjoint sets of 20 points.
+   *
+   * Fix: tile the area with an adaptive quadtree. The crucial property is that
+   * "20 nearest" means a result of 20 points whose farthest is at distance D
+   * guarantees we have EVERY point within D of the query. So each query covers a
+   * disc of radius D; we subdivide a cell only when it hit the 20-cap AND the
+   * cell still extends beyond that coverage. Cells are queried in parallel,
+   * level by level (results dedup by point id). Adapts to density: sparse areas
+   * stop after one query, dense areas subdivide until covered.
+   */
+  async discoverMeetingPoints(
+    center: Point,
+    radiusKm: number,
+    gearbox: Gearbox,
+    onProgress?: (found: number, queries: number) => void,
+  ): Promise<{ points: MeetingPoint[]; queries: number; truncated: boolean }> {
+    const CAP = 20            // backend hard cap on points per query
+    const CONCURRENCY = 8     // verified safe; ~5x faster than sequential
+    const MAX_QUERIES = 400   // safety bound on a single discovery
+    const MIN_CELL_KM = 0.4   // stop subdividing below this to avoid runaway recursion
+
+    interface Cell { minLat: number; maxLat: number; minLng: number; maxLng: number }
+    const kmPerDegLat = 111
+    const kmPerDegLng = 111 * Math.cos((center.lat * Math.PI) / 180)
+    const dLat = radiusKm / kmPerDegLat
+    const dLng = radiusKm / kmPerDegLng
+
+    const corners = (c: Cell): Point[] => [
+      { lat: c.minLat, lng: c.minLng }, { lat: c.minLat, lng: c.maxLng },
+      { lat: c.maxLat, lng: c.minLng }, { lat: c.maxLat, lng: c.maxLng },
+    ]
+    const cellCenter = (c: Cell): Point => ({ lat: (c.minLat + c.maxLat) / 2, lng: (c.minLng + c.maxLng) / 2 })
+    // A cell is relevant only if it intersects the search disc.
+    const intersectsDisc = (c: Cell): boolean =>
+      haversineKm(center, cellCenter(c)) <= radiusKm ||
+      corners(c).some(k => haversineKm(center, k) <= radiusKm)
+
+    // Discs we've already fully resolved: every point within `cov` of `q` is known.
+    // A cell whose every corner lies inside one of these discs is redundant — skip it.
+    const covered: Array<{ q: Point; cov: number }> = []
+    const isCovered = (c: Cell): boolean =>
+      covered.some(d => corners(c).every(k => haversineKm(d.q, k) <= d.cov))
+
+    const found = new Map<string, MeetingPoint>()
+    let queries = 0
+    let truncated = false
+    let level: Cell[] = [{ minLat: center.lat - dLat, maxLat: center.lat + dLat, minLng: center.lng - dLng, maxLng: center.lng + dLng }]
+
+    while (level.length > 0) {
+      const active = level.filter(c => intersectsDisc(c) && !isCovered(c))
+      if (active.length === 0) break
+      if (queries + active.length > MAX_QUERIES) { truncated = true; break }
+
+      const batch = await mapLimit(active, CONCURRENCY, async cell => {
+        const q = cellCenter(cell)
+        const pts = await this.getMeetingPoints(q.lat, q.lng, gearbox)
+        return { cell, q, pts }
+      })
+      queries += active.length
+
+      const next: Cell[] = []
+      for (const { cell, q, pts } of batch) {
+        for (const p of pts) found.set(p.id, p)
+        // Record the proven coverage disc: we know every point within the farthest
+        // returned distance (when capped) — exactly the radius we can safely skip.
+        if (pts.length > 0) covered.push({ q, cov: Math.max(...pts.map(p => haversineKm(q, p))) })
+        if (pts.length >= CAP) {
+          // We reliably know all points within `coverage` of q; subdivide if the
+          // cell still reaches past that (and isn't already tiny).
+          const coverage = Math.max(...pts.map(p => haversineKm(q, p)))
+          const halfDiag = Math.max(...corners(cell).map(k => haversineKm(q, k)))
+          if (halfDiag > coverage && halfDiag > MIN_CELL_KM) {
+            const mLat = (cell.minLat + cell.maxLat) / 2
+            const mLng = (cell.minLng + cell.maxLng) / 2
+            next.push(
+              { minLat: cell.minLat, maxLat: mLat, minLng: cell.minLng, maxLng: mLng },
+              { minLat: cell.minLat, maxLat: mLat, minLng: mLng, maxLng: cell.maxLng },
+              { minLat: mLat, maxLat: cell.maxLat, minLng: cell.minLng, maxLng: mLng },
+              { minLat: mLat, maxLat: cell.maxLat, minLng: mLng, maxLng: cell.maxLng },
+            )
+          }
+        }
+      }
+      onProgress?.(found.size, queries)
+      level = next
+    }
+
+    return { points: [...found.values()], queries, truncated }
   }
 
   async getLocationTeachers(locationId: string, gearbox: Gearbox): Promise<Teacher[]> {

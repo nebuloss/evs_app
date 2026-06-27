@@ -8,6 +8,7 @@ import markerIcon from 'leaflet/dist/images/marker-icon.png'
 import markerShadow from 'leaflet/dist/images/marker-shadow.png'
 import './index.css'
 import App from './App'
+import ErrorBoundary from './components/ErrorBoundary'
 import { ConfigProvider } from './store/config'
 import { QueryStateProvider } from './store/queryState'
 
@@ -18,14 +19,16 @@ const queryClient = new QueryClient()
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <ConfigProvider>
-          <QueryStateProvider>
-            <App />
-          </QueryStateProvider>
-        </ConfigProvider>
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <ConfigProvider>
+            <QueryStateProvider>
+              <App />
+            </QueryStateProvider>
+          </ConfigProvider>
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ErrorBoundary>
   </StrictMode>,
 )

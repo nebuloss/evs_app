@@ -17,7 +17,7 @@ import {
   updateStructure, replacePairSlots,
   type PairMeta, type Slot,
 } from '@/core/snapshot'
-import { cn } from '@/lib/utils'
+import { cn, mapLimit } from '@/lib/utils'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -172,14 +172,31 @@ export default function QueryPage() {
       evictPastSlots(snapshot)
 
       if (structureIsStale(snapshot, 24)) {
-        setProgress({ phase: 'structure', message: 'Discovering meeting points…', current: 0, total: 0 })
-        const points = await evsClient.getMeetingPoints(currentPlace.lat, currentPlace.lng, gearbox)
-        const inRadius = points.filter(p => contains(searchPlace, p))
-        const discovered: PairMeta[] = []
+        // The EVS /availabilities endpoint only returns the ~20 nearest points and
+        // ignores radius, so a single query can't cover the search area. Tile it.
+        setProgress({ phase: 'structure', message: 'Scanning area…', current: 0, total: 0 })
+        const { points, truncated } = await evsClient.discoverMeetingPoints(
+          { lat: currentPlace.lat, lng: currentPlace.lng },
+          currentPlace.radius_km,
+          gearbox,
+          found => setProgress({ phase: 'structure', message: `Scanning area… ${found} meeting point(s) found`, current: 0, total: 0 }),
+        )
+        if (truncated) console.warn('Meeting-point discovery hit its query limit; coverage may be partial.')
+        // Skip points with no upcoming availability at all — saves ~30% of the
+        // teacher/slot calls (a dead location yields no slots anyway).
+        const inRadius = points.filter(p => contains(searchPlace, p) && p.nextAvailability !== null)
 
-        for (const point of inRadius) {
-          setProgress({ phase: 'structure', message: `Loading teachers at ${point.name}…`, current: 0, total: 0 })
+        // Teacher lists fetched in parallel (one slow call per location).
+        let loaded = 0
+        const teacherLists = await mapLimit(inRadius, 8, async point => {
           const teachers = await evsClient.getLocationTeachers(point.id, gearbox)
+          loaded++
+          setProgress({ phase: 'structure', message: `Loading teachers… ${loaded}/${inRadius.length} locations`, current: loaded, total: inRadius.length })
+          return { point, teachers }
+        })
+
+        const discovered: PairMeta[] = []
+        for (const { point, teachers } of teacherLists) {
           for (const t of teachers) {
             discovered.push({
               locationId: point.id, locationName: point.name,
@@ -191,19 +208,26 @@ export default function QueryPage() {
           }
         }
         updateStructure(snapshot, discovered, new Date())
-      }
-
-      const stale = [...stalePairs(snapshot, 1)]
-      for (let i = 0; i < stale.length; i++) {
-        const pairKey = stale[i]
-        const [locId, teacherId] = pairKey.split(':')
-        const pair = snapshot.pairs.find(p => p.locationId === locId && p.teacherId === teacherId)
-        if (!pair) continue
-        setProgress({ phase: 'slots', message: `Fetching slots for ${pair.teacherName} at ${pair.locationName}…`, current: i + 1, total: stale.length })
-        const slots = await evsClient.getTeacherAvailabilities(locId, teacherId, gearbox, pair)
-        replacePairSlots(snapshot, locId, teacherId, slots, new Date())
+        // Persist the costly discovery immediately so an interrupted slot-fetch
+        // doesn't discard it (structure is cached for 24h).
         await saveSnapshot(key, snapshot)
       }
+
+      // Fetch availabilities for stale pairs in parallel. replacePairSlots is
+      // synchronous so it mutates the snapshot atomically between awaits (safe).
+      const stale = [...stalePairs(snapshot, 1)]
+      let fetched = 0
+      const now = new Date()
+      await mapLimit(stale, 8, async pairKey => {
+        const [locId, teacherId] = pairKey.split(':')
+        const pair = snapshot.pairs.find(p => p.locationId === locId && p.teacherId === teacherId)
+        if (!pair) return
+        const slots = await evsClient.getTeacherAvailabilities(locId, teacherId, gearbox, pair)
+        replacePairSlots(snapshot, locId, teacherId, slots, now)
+        fetched++
+        setProgress({ phase: 'slots', message: 'Fetching slots…', current: fetched, total: stale.length })
+      })
+      await saveSnapshot(key, snapshot)
 
       const timeSpec = time ? toTimeSpec(time) : null
       const filtered = applySearch({ place: searchPlace, time: timeSpec, gearbox, minRating }, snapshot.slots)
