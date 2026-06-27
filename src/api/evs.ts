@@ -278,6 +278,7 @@ export class EVSClient {
     radiusKm: number,
     gearbox: Gearbox,
     onProgress?: (found: number, queries: number) => void,
+    shouldStop?: () => boolean,
   ): Promise<{ points: MeetingPoint[]; queries: number; truncated: boolean }> {
     const CAP = 20            // backend hard cap on points per query
     const CONCURRENCY = 16    // measured sweet spot; endpoint throttles past this
@@ -316,7 +317,9 @@ export class EVSClient {
     // subdividing on the fly — no per-level barrier idle (much faster than BFS).
     await new Promise<void>(resolve => {
       const pump = (): void => {
-        if (queue.length === 0 && active === 0) return resolve()
+        // Resolve once nothing is left to do — or once cancelled and in-flight has drained.
+        if ((queue.length === 0 || shouldStop?.()) && active === 0) return resolve()
+        if (shouldStop?.()) return  // cancelled: stop launching; in-flight drains via finally→pump
         while (active < CONCURRENCY && queue.length > 0 && queries < MAX_QUERIES) {
           const cell = queue.shift()!
           if (!intersectsDisc(cell) || isCovered(cell)) continue

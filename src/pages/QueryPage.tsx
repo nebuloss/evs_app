@@ -213,11 +213,23 @@ export default function QueryPage() {
   // Full slot set from the last fetch, kept so rating/day/time filters re-apply instantly (no refetch).
   const lastSlotsRef = useRef<Slot[] | null>(null)
   const didInit = useRef(false)
+  // Cancellation token for the in-flight search (cooperative: stops issuing new requests).
+  const cancelRef = useRef<{ cancelled: boolean } | null>(null)
+
+  const cancelSearch = useCallback(() => {
+    if (cancelRef.current) cancelRef.current.cancelled = true
+    setRunning(false)
+    setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
+  }, [])
 
   const runQuery = useCallback(async (override: Partial<typeof qs> = {}) => {
     const s = { ...qs, ...override }
     const place = s.place
     if (!place) return
+
+    const token = { cancelled: false }
+    cancelRef.current = token
+    const stopped = () => token.cancelled
 
     let fetchAccount = account
     if (!fetchAccount) {
@@ -254,16 +266,20 @@ export default function QueryPage() {
         const { points } = await evsClient.discoverMeetingPoints(
           { lat: place.lat, lng: place.lng }, radius, s.gearbox,
           found => setProgress({ phase: 'structure', message: `Scanning area… ${found} meeting point(s)`, current: 0, total: 0 }),
+          stopped,
         )
+        if (token.cancelled) return
         const inRadius = points.filter(p => contains(searchPlace, p) && p.nextAvailability !== null)
 
         let loaded = 0
         const teacherLists = await mapLimit(inRadius, 16, async point => {
+          if (token.cancelled) return { point, teachers: [] }
           const teachers = await evsClient.getLocationTeachers(point.id, s.gearbox)
           loaded++
           setProgress({ phase: 'structure', message: `Loading teachers… ${loaded}/${inRadius.length} locations`, current: loaded, total: inRadius.length })
           return { point, teachers }
         })
+        if (token.cancelled) return
         const discovered: PairMeta[] = []
         for (const { point, teachers } of teacherLists) {
           for (const t of teachers) {
@@ -286,6 +302,7 @@ export default function QueryPage() {
       let fetched = 0
       const now = new Date()
       await mapLimit(stale, 16, async pairKey => {
+        if (token.cancelled) return
         const [locId, teacherId] = pairKey.split(':')
         const pair = snapshot.pairs.find(p => p.locationId === locId && p.teacherId === teacherId)
         if (!pair) return
@@ -294,6 +311,7 @@ export default function QueryPage() {
         fetched++
         setProgress({ phase: 'slots', message: 'Fetching slots…', current: fetched, total: stale.length })
       })
+      if (token.cancelled) return
       if (stale.length) await saveSnapshot(key, snapshot)
 
       lastSlotsRef.current = snapshot.slots
@@ -310,10 +328,12 @@ export default function QueryPage() {
       const next = [rec, ...recents.filter(r => !(r.place.name === rec.place.name && r.place.radius_km === rec.place.radius_km))].slice(0, 8)
       saveRecents(next); setRecents(next)
     } catch (err) {
+      if (token.cancelled) return  // user cancelled — not a real error
       setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
       setQs({ error: (err as Error).message })
     } finally {
-      setRunning(false)
+      // Only the still-active run clears the loading state (a newer/cancelled run owns it now).
+      if (cancelRef.current === token && !token.cancelled) setRunning(false)
     }
   }, [qs, account, accounts, addAccount, setQs, cacheTtlMin, recents])
 
@@ -441,11 +461,18 @@ export default function QueryPage() {
           </div>
         )}
 
-        <button onClick={() => runQuery()} disabled={!qs.place || running}
-          className={cn('w-full rounded-xl py-3 text-sm font-semibold text-white transition-colors',
-            !qs.place ? 'bg-slate-300 dark:bg-slate-600 cursor-not-allowed' : running ? 'bg-indigo-400 cursor-wait' : 'bg-indigo-600 hover:bg-indigo-700')}>
-          {running ? 'Searching…' : 'Search'}
-        </button>
+        {running ? (
+          <button onClick={cancelSearch}
+            className="w-full rounded-xl py-3 text-sm font-semibold text-white bg-red-600 hover:bg-red-700 transition-colors">
+            Cancel search
+          </button>
+        ) : (
+          <button onClick={() => runQuery()} disabled={!qs.place}
+            className={cn('w-full rounded-xl py-3 text-sm font-semibold text-white transition-colors',
+              !qs.place ? 'bg-slate-300 dark:bg-slate-600 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700')}>
+            Search
+          </button>
+        )}
 
         {progress.phase !== 'idle' && <FetchProgress state={progress} />}
       </section>
