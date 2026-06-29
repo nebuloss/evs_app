@@ -19,6 +19,18 @@ import type { Gearbox } from '@/core/search'
 import type { PairMeta, Slot } from '@/core/snapshot'
 import { haversineKm, type Point } from '@/core/geo'
 
+// ── Errors ──────────────────────────────────────────────────────────────────────
+
+/** Thrown on a non-2xx EVS response. Carries the HTTP status so callers can
+ *  distinguish an expected 404 (e.g. a teacher with no slots) from a real
+ *  backend/auth failure (401/5xx) that should be surfaced to the user. */
+export class EvsHttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message)
+    this.name = 'EvsHttpError'
+  }
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 export interface AuthTokens {
@@ -157,6 +169,11 @@ function randPhone(): string {
 export class EVSClient {
   private tokens: AuthTokens | null = null
   private accountName: string | null = null
+  // Credentials of the active account, remembered so the client can transparently
+  // re-authenticate when the backend rejects a stored token with 401.
+  private creds: { email: string; password: string } | null = null
+  // Shared in-flight re-auth, so a burst of concurrent 401s triggers a single sign-in.
+  private reauth: Promise<void> | null = null
 
   /**
    * Switches the active account by loading its tokens from localStorage.
@@ -167,7 +184,22 @@ export class EVSClient {
     this.tokens = loadTokensFor(accountName)
   }
 
-  private async request(method: string, path: string, body?: unknown): Promise<Response> {
+  /** Remembers the active account's credentials for transparent 401 recovery. */
+  setCredentials(email: string, password: string): void {
+    this.creds = { email, password }
+  }
+
+  /** Signs in once for a burst of concurrent 401s (deduped via a shared promise). */
+  private ensureReauth(): Promise<void> {
+    if (!this.creds) return Promise.reject(new Error('No credentials for re-auth'))
+    if (!this.reauth) {
+      const { email, password } = this.creds
+      this.reauth = this.signIn(email, password).then(() => undefined).finally(() => { this.reauth = null })
+    }
+    return this.reauth
+  }
+
+  private async request(method: string, path: string, body?: unknown, isRetry = false): Promise<Response> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-App-Version': APP_VERSION,
@@ -195,6 +227,19 @@ export class EVSClient {
       if (this.accountName) saveTokens(this.accountName, newTokens)
     }
 
+    // Self-heal: a 401 means our stored token was rejected even though it wasn't
+    // locally expired (rotated/invalidated/corrupted). Re-sign-in once and retry —
+    // this is what makes a search recover instead of silently returning nothing.
+    const isAuthCall = path === '/api/auth' || path === '/api/auth/sign_in'
+    if (res.status === 401 && !isRetry && !isAuthCall && this.creds) {
+      try {
+        await this.ensureReauth()
+        return await this.request(method, path, body, true)
+      } catch {
+        return res  // re-auth failed — surface the original 401 to the caller
+      }
+    }
+
     return res
   }
 
@@ -206,11 +251,14 @@ export class EVSClient {
 
   /** Signs in only if the current tokens are expired; otherwise does nothing. */
   async ensureAuth(email: string, password: string): Promise<string | null> {
+    // Remember creds even when the token looks valid, so a later 401 can self-heal.
+    this.setCredentials(email, password)
     if (!this.isExpired()) return null
     return (await this.signIn(email, password)).studentId
   }
 
   async signIn(email: string, password: string): Promise<{ tokens: AuthTokens; studentId: string }> {
+    this.setCredentials(email, password)
     const res = await this.request('POST', '/api/auth/sign_in', { email, password })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
@@ -245,13 +293,14 @@ export class EVSClient {
     }
     const data = await res.json() as { data: { id: string } }
     if (!this.tokens) throw new Error('No tokens returned from registration')
+    this.setCredentials(email, password)
     return { tokens: this.tokens, studentId: String(data.data.id), email, password }
   }
 
   async getMeetingPoints(lat: number, lng: number, gearbox: Gearbox): Promise<MeetingPoint[]> {
     const qs = new URLSearchParams({ latitude: lat.toString(), longitude: lng.toString(), gearbox_type: gearbox })
     const res = await this.request('GET', `/api/v3/availabilities?${qs}`)
-    if (!res.ok) throw new Error('Failed to get meeting points')
+    if (!res.ok) throw new EvsHttpError(res.status, 'Failed to get meeting points')
     const data = await res.json() as { data: Array<{ id: string; name: string; latitude: number; longitude: number; next_availability: string | null }> }
     return data.data.map(p => ({ id: p.id, name: p.name, lat: p.latitude, lng: p.longitude, nextAvailability: p.next_availability ?? null }))
   }
@@ -279,7 +328,7 @@ export class EVSClient {
     gearbox: Gearbox,
     onProgress?: (found: number, queries: number) => void,
     shouldStop?: () => boolean,
-  ): Promise<{ points: MeetingPoint[]; queries: number; truncated: boolean }> {
+  ): Promise<{ points: MeetingPoint[]; queries: number; truncated: boolean; failures: number }> {
     const CAP = 20            // backend hard cap on points per query
     const CONCURRENCY = 16    // measured sweet spot; endpoint throttles past this
     const MAX_QUERIES = 500   // safety bound on a single discovery
@@ -311,6 +360,7 @@ export class EVSClient {
     let queries = 0
     let active = 0
     let truncated = false
+    let failures = 0
     const queue: Cell[] = [{ minLat: center.lat - dLat, maxLat: center.lat + dLat, minLng: center.lng - dLng, maxLng: center.lng + dLng }]
 
     // Continuous work-pool: keep CONCURRENCY queries in flight at all times,
@@ -347,20 +397,20 @@ export class EVSClient {
               }
             }
             onProgress?.(found.size, queries)
-          }).catch(() => {}).finally(() => { active--; pump() })
+          }).catch(() => { failures++ }).finally(() => { active--; pump() })
         }
         if (queries >= MAX_QUERIES && queue.length > 0) truncated = true
       }
       pump()
     })
 
-    return { points: [...found.values()], queries, truncated }
+    return { points: [...found.values()], queries, truncated, failures }
   }
 
   async getLocationTeachers(locationId: string, gearbox: Gearbox): Promise<Teacher[]> {
     const qs = new URLSearchParams({ gearbox_type: gearbox })
     const res = await this.request('GET', `/api/v3/locations/${locationId}/teachers?${qs}`)
-    if (!res.ok) throw new Error(`Failed to get teachers for location ${locationId}`)
+    if (!res.ok) throw new EvsHttpError(res.status, `Failed to get teachers for location ${locationId}`)
     const data = await res.json() as {
       data: {
         teachers: Array<{
@@ -389,7 +439,7 @@ export class EVSClient {
   ): Promise<Slot[]> {
     const qs = new URLSearchParams({ teacher_id: teacherId, gearbox_type: gearbox })
     const res = await this.request('GET', `/api/v3/locations/${locationId}/teachers_availabilities?${qs}`)
-    if (!res.ok) throw new Error(`Failed to get availabilities for teacher ${teacherId}`)
+    if (!res.ok) throw new EvsHttpError(res.status, `Failed to get availabilities for teacher ${teacherId}`)
     const data = await res.json() as {
       data: Array<{ date: string; slots: Array<{ starts_at: string; duration: number }> }>
     }

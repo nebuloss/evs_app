@@ -9,7 +9,7 @@ import {
   type Account, type RecentSearch,
 } from '@/store/config'
 import { useQueryState, type GeoPoint } from '@/store/queryState'
-import { evsClient } from '@/api/evs'
+import { evsClient, EvsHttpError } from '@/api/evs'
 import { contains, type SearchPlace } from '@/core/geo'
 import { applySearch } from '@/core/search'
 import { type TimeSpec } from '@/core/time'
@@ -279,20 +279,30 @@ export default function QueryPage() {
       evsClient.loadAccountTokens(fetchAccount.name)
       await evsClient.ensureAuth(fetchAccount.email, fetchAccount.password)
 
+      // Count genuine backend failures (not expected 404s) so a wholly-failed
+      // search reports an error instead of silently showing "0 slots".
+      const isReal = (err: unknown) => !(err instanceof EvsHttpError && err.status === 404)
+
       let snapshot = (await loadSnapshot(key)) ?? emptySnapshot()
       evictPastSlots(snapshot)
 
       if (structureIsStale(snapshot, 24)) {
         setProgress({ phase: 'structure', message: 'Scanning area…', current: 0, total: 0 })
-        const { points } = await evsClient.discoverMeetingPoints(
+        const { points, failures } = await evsClient.discoverMeetingPoints(
           { lat: place.lat, lng: place.lng }, radius, s.gearbox,
           found => setProgress({ phase: 'structure', message: `Scanning area… ${found} meeting point(s)`, current: 0, total: 0 }),
           stopped,
         )
         if (token.cancelled) return
+        // If the area scan found nothing yet calls were failing, the backend is
+        // unreachable / auth is rejected — surface it rather than "no slots".
+        if (points.length === 0 && failures > 0) {
+          throw new Error(`Couldn't reach EVS to scan the area (${failures} request${failures > 1 ? 's' : ''} failed). Check your connection, or clear the cache in Settings and retry.`)
+        }
         const inRadius = points.filter(p => contains(searchPlace, p) && p.nextAvailability !== null)
 
         let loaded = 0
+        let teacherFailures = 0
         const teacherLists = await mapLimit(inRadius, 16, async point => {
           if (token.cancelled) return { point, teachers: [] }
           // A failed teacher fetch (404/transient) for one point must not abort the
@@ -300,7 +310,7 @@ export default function QueryPage() {
           let teachers: Awaited<ReturnType<typeof evsClient.getLocationTeachers>> = []
           try {
             teachers = await evsClient.getLocationTeachers(point.id, s.gearbox)
-          } catch { /* skip this point */ }
+          } catch (err) { if (isReal(err)) teacherFailures++ }
           loaded++
           setProgress({ phase: 'structure', message: `Loading teachers… ${loaded}/${inRadius.length} locations`, current: loaded, total: inRadius.length })
           return { point, teachers }
@@ -318,6 +328,11 @@ export default function QueryPage() {
             })
           }
         }
+        // Found points but couldn't load any teachers, and calls were failing —
+        // that's a backend/auth failure, not an empty area.
+        if (inRadius.length > 0 && discovered.length === 0 && teacherFailures > 0) {
+          throw new Error(`Couldn't load teachers — ${teacherFailures} request(s) failed (backend or sign-in error). Try again, or clear the cache in Settings.`)
+        }
         updateStructure(snapshot, discovered, new Date())
         await saveSnapshot(key, snapshot)
       }
@@ -326,6 +341,7 @@ export default function QueryPage() {
       const ttlHours = cacheTtlMin / 60
       const stale = [...stalePairs(snapshot, ttlHours)]
       let fetched = 0
+      let slotFailures = 0
       const now = new Date()
       await mapLimit(stale, 16, async pairKey => {
         if (token.cancelled) return
@@ -338,12 +354,17 @@ export default function QueryPage() {
         let slots: Slot[] = []
         try {
           slots = await evsClient.getTeacherAvailabilities(locId, teacherId, s.gearbox, pair)
-        } catch { /* no slots for this pair */ }
+        } catch (err) { if (isReal(err)) slotFailures++ }
         replacePairSlots(snapshot, locId, teacherId, slots, now)
         fetched++
         setProgress({ phase: 'slots', message: 'Fetching slots…', current: fetched, total: stale.length })
       })
       if (token.cancelled) return
+      // Every slot fetch failed (e.g. auth rejected) — don't cache an empty result
+      // or pretend there are no slots; tell the user the backend calls failed.
+      if (stale.length > 0 && slotFailures === stale.length) {
+        throw new Error(`Couldn't load slots — all ${stale.length} request(s) failed (backend or sign-in error). Try again, or clear the cache in Settings.`)
+      }
       if (stale.length) await saveSnapshot(key, snapshot)
 
       lastSlotsRef.current = snapshot.slots
