@@ -219,13 +219,15 @@ const PAGE_SIZE = 5
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function QueryPage() {
-  const { accounts, activeAccount: account, addAccount } = useAccounts()
+  const { accounts, activeAccount: account, addAccount, removeAccount } = useAccounts()
   const { add: addToWishlist, remove: removeFromWishlist, has: inWishlist } = useWishlist()
   const { cacheTtlMin } = useSettings()
   const { state: qs, setState: setQs } = useQueryState()
 
   const [running, setRunning] = useState(false)
   const [anonError, setAnonError] = useState<string | null>(null)
+  // Name of a real account whose session expired — shows a "sign in again" prompt.
+  const [sessionExpired, setSessionExpired] = useState<string | null>(null)
   const [progress, setProgress] = useState<ProgressState>({ phase: 'idle', message: '', current: 0, total: 0 })
   const [recents, setRecents] = useState<RecentSearch[]>(() => loadRecents())
   const [mapLocation, setMapLocation] = useState<{ name: string; lat: number; lng: number } | null>(null)
@@ -269,10 +271,11 @@ export default function QueryPage() {
       // Count genuine backend failures (not expected 404s) so a wholly-failed
       // search reports an error instead of silently showing "0 slots".
       const isReal = (err: unknown) => !(err instanceof EvsHttpError && err.status === 404)
+      // Set when a real account's token is rejected mid-search (401) — surfaced as a
+      // "session expired" prompt rather than a generic failure.
+      let unauthorized = false
 
-      // Authenticate by re-using stored credentials: ensureAuth re-signs-in when
-      // the token has expired (no new account needed). Returns false if the creds
-      // are rejected (e.g. the anonymous account was deleted server-side).
+      // Anonymous: transparently re-sign-in with stored credentials on token expiry.
       const authWith = async (acc: Account): Promise<boolean> => {
         evsClient.loadAccountTokens(acc.name)
         try { await evsClient.ensureAuth(acc.email, acc.password); return true }
@@ -280,12 +283,27 @@ export default function QueryPage() {
       }
 
       let authed = false
-      if (fetchAccount) authed = await authWith(fetchAccount)
+      if (fetchAccount && !fetchAccount.anonymous) {
+        // Real account: behave like a normal website — if the session has expired,
+        // ask the user to sign in again (or log out) instead of silently refreshing.
+        evsClient.loadAccountTokens(fetchAccount.name)
+        evsClient.setSilentReauth(false)
+        if (evsClient.isExpired()) {
+          setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
+          setSessionExpired(fetchAccount.name)
+          return
+        }
+        authed = true
+      } else if (fetchAccount) {
+        evsClient.setSilentReauth(true)
+        authed = await authWith(fetchAccount)
+      }
       if (token.cancelled) return
       // Last resort: register a fresh anonymous account only when there's no
       // account at all, or a stored anonymous one's credentials no longer work.
-      // A real account is never silently replaced — its sign-in error is surfaced.
+      // A real account is never silently replaced.
       if (!authed && (!fetchAccount || fetchAccount.anonymous)) {
+        evsClient.setSilentReauth(true)
         try {
           evsClient.loadAccountTokens('__anon_tmp__')
           const reg = await evsClient.registerAnonymous()
@@ -298,7 +316,7 @@ export default function QueryPage() {
         } catch (err) { if (token.cancelled) return; setAnonError((err as Error).message); return }
       }
       if (token.cancelled) return
-      if (!authed || !fetchAccount) throw new Error("Sign-in failed — check this account's email and password.")
+      if (!authed || !fetchAccount) throw new Error('Sign-in failed — please try again.')
 
       let snapshot = (await loadSnapshot(key)) ?? emptySnapshot()
       evictPastSlots(snapshot)
@@ -329,7 +347,10 @@ export default function QueryPage() {
           let teachers: Awaited<ReturnType<typeof evsClient.getLocationTeachers>> = []
           try {
             teachers = await evsClient.getLocationTeachers(point.id, s.gearbox)
-          } catch (err) { if (isReal(err)) teacherFailures++ }
+          } catch (err) {
+            if (err instanceof EvsHttpError && err.status === 401) unauthorized = true
+            else if (isReal(err)) teacherFailures++
+          }
           loaded++
           setProgress({ phase: 'structure', message: `Loading teachers… ${loaded}/${inRadius.length} locations`, current: loaded, total: inRadius.length })
           return { point, teachers }
@@ -346,6 +367,12 @@ export default function QueryPage() {
               slotsFetchedAt: null,
             })
           }
+        }
+        // Real account's token was rejected (401) — prompt to sign in again.
+        if (unauthorized && fetchAccount && !fetchAccount.anonymous) {
+          setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
+          setSessionExpired(fetchAccount.name)
+          return
         }
         // Found points but couldn't load any teachers, and calls were failing —
         // that's a backend/auth failure, not an empty area.
@@ -373,12 +400,21 @@ export default function QueryPage() {
         let slots: Slot[] = []
         try {
           slots = await evsClient.getTeacherAvailabilities(locId, teacherId, s.gearbox, pair)
-        } catch (err) { if (isReal(err)) slotFailures++ }
+        } catch (err) {
+          if (err instanceof EvsHttpError && err.status === 401) unauthorized = true
+          else if (isReal(err)) slotFailures++
+        }
         replacePairSlots(snapshot, locId, teacherId, slots, now)
         fetched++
         setProgress({ phase: 'slots', message: 'Fetching slots…', current: fetched, total: stale.length })
       })
       if (token.cancelled) return
+      // Real account's token was rejected (401) — prompt to sign in again.
+      if (unauthorized && fetchAccount && !fetchAccount.anonymous) {
+        setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
+        setSessionExpired(fetchAccount.name)
+        return
+      }
       // Every slot fetch failed (e.g. auth rejected) — don't cache an empty result
       // or pretend there are no slots; tell the user the backend calls failed.
       if (stale.length > 0 && slotFailures === stale.length) {
@@ -408,6 +444,33 @@ export default function QueryPage() {
       if (cancelRef.current === token && !token.cancelled) setRunning(false)
     }
   }, [qs, account, accounts, addAccount, setQs, cacheTtlMin, recents])
+
+  // "Sign in again" from the session-expired prompt: re-authenticate the real
+  // account with its stored credentials, then re-run the search.
+  const handleResignIn = useCallback(async () => {
+    const name = sessionExpired
+    setSessionExpired(null)
+    const acc = accounts.find(a => a.name === name)
+    if (!acc) return
+    try {
+      evsClient.loadAccountTokens(acc.name)
+      evsClient.setSilentReauth(false)
+      await evsClient.signIn(acc.email, acc.password)
+      runQuery()
+    } catch {
+      setSessionExpired(name)  // still failing — show the prompt again
+    }
+  }, [sessionExpired, accounts, runQuery])
+
+  // "Log out" from the session-expired prompt: clear the account's session.
+  const handleLogoutExpired = useCallback(() => {
+    const name = sessionExpired
+    setSessionExpired(null)
+    if (!name) return
+    evsClient.loadAccountTokens(name)
+    evsClient.clearTokens()
+    removeAccount(name)
+  }, [sessionExpired, removeAccount])
 
   // Restore last search on first mount (filters only; user taps Search or a recent chip to run).
   useEffect(() => {
@@ -637,6 +700,27 @@ export default function QueryPage() {
             <p className="text-sm text-slate-500 dark:text-slate-400">Failed to create a temporary session to fetch slots. Check your connection and try again.</p>
             <p className="text-xs text-red-600 dark:text-red-400 font-mono">{anonError}</p>
             <button onClick={() => setAnonError(null)} className="w-full rounded-xl bg-indigo-600 hover:bg-indigo-700 py-2.5 text-sm font-semibold text-white">Close</button>
+          </div>
+        </div>
+      )}
+      {sessionExpired && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setSessionExpired(null)} />
+          <div className="relative bg-white dark:bg-slate-800 rounded-2xl shadow-xl w-full max-w-sm mx-4 p-6 space-y-4">
+            <p className="font-semibold text-slate-900 dark:text-slate-100">Session expired</p>
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Your session for <span className="font-medium text-slate-700 dark:text-slate-300">{sessionExpired}</span> has expired. Sign in again to continue, or log out.
+            </p>
+            <div className="flex gap-3 pt-1">
+              <button onClick={handleLogoutExpired}
+                className="flex-1 rounded-xl border border-slate-200 dark:border-slate-600 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">
+                Log out
+              </button>
+              <button onClick={handleResignIn}
+                className="flex-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 py-2.5 text-sm font-semibold text-white transition-colors">
+                Sign in again
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -174,6 +174,14 @@ export class EVSClient {
   private creds: { email: string; password: string } | null = null
   // Shared in-flight re-auth, so a burst of concurrent 401s triggers a single sign-in.
   private reauth: Promise<void> | null = null
+  // Whether a 401 may be recovered transparently. True for anonymous sessions;
+  // false for real accounts, which should be prompted to sign in again instead.
+  private silentReauth = true
+
+  /** Controls whether 401s are recovered transparently (anonymous) or surfaced (real). */
+  setSilentReauth(allow: boolean): void {
+    this.silentReauth = allow
+  }
 
   /**
    * Switches the active account by loading its tokens from localStorage.
@@ -231,7 +239,7 @@ export class EVSClient {
     // locally expired (rotated/invalidated/corrupted). Re-sign-in once and retry —
     // this is what makes a search recover instead of silently returning nothing.
     const isAuthCall = path === '/api/auth' || path === '/api/auth/sign_in'
-    if (res.status === 401 && !isRetry && !isAuthCall && this.creds) {
+    if (res.status === 401 && !isRetry && !isAuthCall && this.creds && this.silentReauth) {
       try {
         await this.ensureReauth()
         return await this.request(method, path, body, true)
