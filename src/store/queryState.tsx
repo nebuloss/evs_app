@@ -25,7 +25,7 @@ export interface QueryState {
 
 const defaultState: QueryState = {
   place: null,
-  radiusKm: 20,
+  radiusKm: 10,
   gearbox: 'bvm',
   minRating: 0,
   days: [],

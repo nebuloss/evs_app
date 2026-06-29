@@ -119,12 +119,15 @@ app.get('/geocode', async (req, res) => {
     upRes.on('data', chunk => { data += chunk })
     upRes.on('end', () => {
       try {
-        const raw = JSON.parse(data) as Array<{ display_name: string; lat: string; lon: string; type: string }>
+        const raw = JSON.parse(data) as Array<{ display_name: string; lat: string; lon: string; type: string; boundingbox?: [string, string, string, string] }>
         const candidates = raw.map(r => ({
           display_name: r.display_name,
           lat: parseFloat(r.lat),
           lng: parseFloat(r.lon),
           place_type: r.type,
+          // [south, north, west, east] — lets the client auto-fit the search radius
+          // to the place's actual extent (a city vs a single address).
+          boundingbox: r.boundingbox ? r.boundingbox.map(parseFloat) : null,
         }))
         res.json(candidates)
       } catch {

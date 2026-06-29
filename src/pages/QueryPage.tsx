@@ -32,6 +32,27 @@ function buildTimeSpec(days: number[], anyTime: boolean, tStart: string, tEnd: s
   return { type: 'schedule', weekdays: days, windows: anyTime ? [] : [{ start: tStart, end: tEnd }] }
 }
 
+/** Search radius bounds (km) when auto-fitting to a picked place. */
+const MIN_RADIUS = 3
+const MAX_RADIUS = 25
+
+/**
+ * Derives a sensible search radius from a geocoded place's bounding box, so
+ * picking a city uses the city's own extent (e.g. Paris ≈ 10 km) and a precise
+ * address uses the floor. Returns null when no usable box is available.
+ * `bbox` is Nominatim's [south, north, west, east] in degrees.
+ */
+function radiusFromBBox(bbox: number[] | null | undefined, lat: number): number | null {
+  if (!bbox || bbox.length !== 4) return null
+  const [south, north, west, east] = bbox
+  const latKm = Math.abs(north - south) * 111
+  const lngKm = Math.abs(east - west) * 111 * Math.cos((lat * Math.PI) / 180)
+  if (!isFinite(latKm) || !isFinite(lngKm)) return null
+  // Half-diagonal covers the whole box from its centre.
+  const halfDiag = 0.5 * Math.sqrt(latKm * latKm + lngKm * lngKm)
+  return Math.min(MAX_RADIUS, Math.max(MIN_RADIUS, Math.round(halfDiag)))
+}
+
 function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
   const mins = Math.floor(diff / 60_000)
@@ -127,9 +148,9 @@ function Popover({ trigger, children, panelClass }: { trigger: React.ReactNode; 
 
 // ── Location autocomplete ─────────────────────────────────────────────────────
 
-interface GeoCandidate { display_name: string; lat: number; lng: number; place_type: string }
+interface GeoCandidate { display_name: string; lat: number; lng: number; place_type: string; boundingbox: number[] | null }
 
-function LocationSearch({ value, onPick }: { value: string; onPick: (g: GeoPoint) => void }) {
+function LocationSearch({ value, onPick }: { value: string; onPick: (g: GeoPoint, suggestedRadius: number | null) => void }) {
   const [q, setQ] = useState(value)
   const [cands, setCands] = useState<GeoCandidate[]>([])
   const [open, setOpen] = useState(false)
@@ -159,7 +180,7 @@ function LocationSearch({ value, onPick }: { value: string; onPick: (g: GeoPoint
   const pick = (c: GeoCandidate) => {
     const name = c.display_name.split(',')[0].trim()
     setQ(name); setOpen(false); setCands([])
-    onPick({ name, lat: c.lat, lng: c.lng })
+    onPick({ name, lat: c.lat, lng: c.lng }, radiusFromBBox(c.boundingbox, c.lat))
   }
 
   return (
@@ -381,7 +402,13 @@ export default function QueryPage() {
     runQuery(override)
   }
 
-  const onPickLocation = (g: GeoPoint) => { setQs({ place: g }); runQuery({ place: g }) }
+  // Auto-fit the radius to the picked place's extent (city vs address); the user
+  // can still adjust the slider afterwards and re-search.
+  const onPickLocation = (g: GeoPoint, suggestedRadius: number | null) => {
+    const radiusKm = suggestedRadius ?? qs.radiusKm
+    setQs({ place: g, radiusKm })
+    runQuery({ place: g, radiusKm })
+  }
 
   const dayGroups = qs.results ? groupSlots(qs.results) : []
   const visibleGroups = dayGroups.slice(0, qs.visibleDays)
