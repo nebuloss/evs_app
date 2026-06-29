@@ -286,7 +286,9 @@ export default function QueryPage() {
       let snapshot = (await loadSnapshot(key)) ?? emptySnapshot()
       evictPastSlots(snapshot)
 
-      if (structureIsStale(snapshot, 24)) {
+      // Re-discover if the structure is stale OR empty — an empty cached structure
+      // (e.g. saved by an older buggy run) would otherwise skip discovery forever.
+      if (structureIsStale(snapshot, 24) || snapshot.pairs.length === 0) {
         setProgress({ phase: 'structure', message: 'Scanning area…', current: 0, total: 0 })
         const { points, failures } = await evsClient.discoverMeetingPoints(
           { lat: place.lat, lng: place.lng }, radius, s.gearbox,
