@@ -274,7 +274,12 @@ export default function QueryPage() {
         let loaded = 0
         const teacherLists = await mapLimit(inRadius, 16, async point => {
           if (token.cancelled) return { point, teachers: [] }
-          const teachers = await evsClient.getLocationTeachers(point.id, s.gearbox)
+          // A failed teacher fetch (404/transient) for one point must not abort the
+          // whole search — skip that point and keep going.
+          let teachers: Awaited<ReturnType<typeof evsClient.getLocationTeachers>> = []
+          try {
+            teachers = await evsClient.getLocationTeachers(point.id, s.gearbox)
+          } catch { /* skip this point */ }
           loaded++
           setProgress({ phase: 'structure', message: `Loading teachers… ${loaded}/${inRadius.length} locations`, current: loaded, total: inRadius.length })
           return { point, teachers }
@@ -306,7 +311,13 @@ export default function QueryPage() {
         const [locId, teacherId] = pairKey.split(':')
         const pair = snapshot.pairs.find(p => p.locationId === locId && p.teacherId === teacherId)
         if (!pair) return
-        const slots = await evsClient.getTeacherAvailabilities(locId, teacherId, s.gearbox, pair)
+        // The EVS slots endpoint returns 404 for teachers with no bookable
+        // availability — that's expected, not a failure. Treat any error as
+        // "no slots" and cache it so one bad pair can't abort the whole search.
+        let slots: Slot[] = []
+        try {
+          slots = await evsClient.getTeacherAvailabilities(locId, teacherId, s.gearbox, pair)
+        } catch { /* no slots for this pair */ }
         replacePairSlots(snapshot, locId, teacherId, slots, now)
         fetched++
         setProgress({ phase: 'slots', message: 'Fetching slots…', current: fetched, total: stale.length })

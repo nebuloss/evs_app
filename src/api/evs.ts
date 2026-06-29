@@ -317,8 +317,12 @@ export class EVSClient {
     // subdividing on the fly — no per-level barrier idle (much faster than BFS).
     await new Promise<void>(resolve => {
       const pump = (): void => {
-        // Resolve once nothing is left to do — or once cancelled and in-flight has drained.
-        if ((queue.length === 0 || shouldStop?.()) && active === 0) return resolve()
+        // Nothing more can be launched once the queue drains OR we hit the query cap.
+        // Resolve when that's true and all in-flight requests have drained — also on
+        // cancel. (Without the cap check this deadlocks: at MAX_QUERIES with cells still
+        // queued, no new request is launched so finally→pump never fires again.)
+        const exhausted = queue.length === 0 || queries >= MAX_QUERIES
+        if ((exhausted || shouldStop?.()) && active === 0) return resolve()
         if (shouldStop?.()) return  // cancelled: stop launching; in-flight drains via finally→pump
         while (active < CONCURRENCY && queue.length > 0 && queries < MAX_QUERIES) {
           const cell = queue.shift()!
