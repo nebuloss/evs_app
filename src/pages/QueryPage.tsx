@@ -252,20 +252,10 @@ export default function QueryPage() {
     cancelRef.current = token
     const stopped = () => token.cancelled
 
-    let fetchAccount = account
-    if (!fetchAccount) {
-      const existing = accounts.find(a => a.anonymous) ?? null
-      if (existing) fetchAccount = existing
-      else {
-        try {
-          evsClient.loadAccountTokens('__anon_tmp__')
-          const { studentId, email, password } = await evsClient.registerAnonymous()
-          const anon: Account = { name: 'Anonymous', email, password, studentId, anonymous: true }
-          addAccount(anon)
-          fetchAccount = anon
-        } catch (err) { setAnonError((err as Error).message); return }
-      }
-    }
+    // Pick a candidate account (active, else a stored anonymous one). We don't
+    // register here — authentication below re-signs-in with stored credentials on
+    // token expiry, and only registers a new anonymous account as a last resort.
+    let fetchAccount: Account | null = account ?? accounts.find(a => a.anonymous) ?? null
 
     setRunning(true)
     setProgress({ phase: 'evict', message: 'Preparing cache…', current: 0, total: 0 })
@@ -276,12 +266,39 @@ export default function QueryPage() {
     const key = zoneKey(place, radius)
 
     try {
-      evsClient.loadAccountTokens(fetchAccount.name)
-      await evsClient.ensureAuth(fetchAccount.email, fetchAccount.password)
-
       // Count genuine backend failures (not expected 404s) so a wholly-failed
       // search reports an error instead of silently showing "0 slots".
       const isReal = (err: unknown) => !(err instanceof EvsHttpError && err.status === 404)
+
+      // Authenticate by re-using stored credentials: ensureAuth re-signs-in when
+      // the token has expired (no new account needed). Returns false if the creds
+      // are rejected (e.g. the anonymous account was deleted server-side).
+      const authWith = async (acc: Account): Promise<boolean> => {
+        evsClient.loadAccountTokens(acc.name)
+        try { await evsClient.ensureAuth(acc.email, acc.password); return true }
+        catch { return false }
+      }
+
+      let authed = false
+      if (fetchAccount) authed = await authWith(fetchAccount)
+      if (token.cancelled) return
+      // Last resort: register a fresh anonymous account only when there's no
+      // account at all, or a stored anonymous one's credentials no longer work.
+      // A real account is never silently replaced — its sign-in error is surfaced.
+      if (!authed && (!fetchAccount || fetchAccount.anonymous)) {
+        try {
+          evsClient.loadAccountTokens('__anon_tmp__')
+          const reg = await evsClient.registerAnonymous()
+          const anon: Account = { name: 'Anonymous', email: reg.email, password: reg.password, studentId: reg.studentId, anonymous: true }
+          addAccount(anon)
+          fetchAccount = anon
+          // Re-sign-in so tokens are stored under the account name (registration
+          // tokens aren't accepted on data endpoints).
+          authed = await authWith(anon)
+        } catch (err) { if (token.cancelled) return; setAnonError((err as Error).message); return }
+      }
+      if (token.cancelled) return
+      if (!authed || !fetchAccount) throw new Error("Sign-in failed — check this account's email and password.")
 
       let snapshot = (await loadSnapshot(key)) ?? emptySnapshot()
       evictPastSlots(snapshot)
