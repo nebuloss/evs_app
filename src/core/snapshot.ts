@@ -85,6 +85,12 @@ export function emptySnapshot(): Snapshot {
   return { structureFetchedAt: null, pairs: [], slots: [] }
 }
 
+/** Wipes every cached zone snapshot. Used by the "Clear cache" action to recover
+ *  from a corrupted/partial cache (e.g. a snapshot saved after a failed search). */
+export async function clearSnapshots(): Promise<void> {
+  await (await getDb()).clear('snapshots')
+}
+
 // ── Staleness checks ──────────────────────────────────────────────────────────
 
 /** Returns true if the pair list hasn't been refreshed within `ttlHours`. */

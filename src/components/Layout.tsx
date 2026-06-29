@@ -4,6 +4,7 @@ import { Search, Heart, User, Settings, ChevronDown, Check, Plus, Trash2, Sun, M
 import { cn } from '@/lib/utils'
 import { useAccounts, useTheme, useSettings, type Account } from '@/store/config'
 import { evsClient } from '@/api/evs'
+import { clearSnapshots } from '@/core/snapshot'
 import AccountModal from '@/components/AccountModal'
 import { useEscapeKey, useEnterKey } from '@/hooks/useKeyShortcuts'
 
@@ -82,7 +83,19 @@ function ThemeToggle() {
 function SettingsMenu() {
   const { cacheTtlMin, setCacheTtlMin } = useSettings()
   const [open, setOpen] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
+
+  const handleClearCache = async () => {
+    setClearing(true)
+    try {
+      await clearSnapshots()
+    } catch (err) {
+      console.warn('Failed to clear cache:', err)
+    }
+    // Reload to drop any in-memory results so the next search starts clean.
+    window.location.reload()
+  }
   useEffect(() => {
     if (!open) return
     const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
@@ -116,6 +129,18 @@ function SettingsMenu() {
             ))}
           </div>
           <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-2"><b>0</b> = always fetch fresh from EVS.</p>
+
+          <div className="my-3 h-px bg-slate-100 dark:bg-slate-700" />
+          <p className="text-sm font-semibold mb-1">Cached results</p>
+          <p className="text-[11px] text-slate-400 dark:text-slate-500 mb-3">Clear all saved results if they look stale, empty, or corrupted.</p>
+          <button
+            onClick={handleClearCache}
+            disabled={clearing}
+            className="flex w-full items-center justify-center gap-2 rounded-xl border border-red-200 dark:border-red-900/50 py-2.5 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 transition-colors disabled:opacity-50"
+          >
+            <Trash2 size={15} />
+            {clearing ? 'Clearing…' : 'Clear cache'}
+          </button>
         </div>
       )}
     </div>
