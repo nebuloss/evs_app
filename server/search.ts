@@ -53,7 +53,11 @@ async function scan(key: string, p: ScanParams, emit: Emit): Promise<ScanResult>
     if (points.length === 0 && failures > 0) {
       throw new EvsHttpError(502, `Couldn't reach EVS to scan the area (${failures} request(s) failed)`)
     }
-    const inRadius = points.filter(pt => haversineKm(center, pt) <= p.radiusKm && pt.nextAvailability !== null)
+    // NB: do NOT prune by next_availability — the EVS /availabilities endpoint
+    // reports next_availability:null even for points that DO have bookable slots
+    // (e.g. Place de la Nation), so filtering on it drops real availability. We
+    // fetch teachers/slots for every in-radius point; the cache makes this cheap.
+    const inRadius = points.filter(pt => haversineKm(center, pt) <= p.radiusKm)
 
     let loaded = 0
     const teacherLists = await mapLimit(inRadius, CONCURRENCY, async point => {

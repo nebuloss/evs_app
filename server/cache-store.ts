@@ -16,8 +16,9 @@ import type { Snapshot, PairMeta, Slot, Gearbox } from '../src/core/types'
 const CACHE_DIR = process.env.EVS_CACHE_DIR || path.join(process.cwd(), 'cache')
 const ZONES_DIR = path.join(CACHE_DIR, 'zones')
 // Bump when the cached data shape/semantics change so old zone files are ignored
-// (treated as a miss → re-scanned). v2 fixes locale-dependent "Invalid Date" slots.
-const CACHE_VERSION = 2
+// (treated as a miss → re-scanned). v2: locale-independent slot times. v3: stop
+// pruning points by next_availability (it dropped places that had slots).
+const CACHE_VERSION = 3
 
 // ── Keys & files ─────────────────────────────────────────────────────────────────
 
