@@ -15,6 +15,9 @@ import type { Snapshot, PairMeta, Slot, Gearbox } from '../src/core/types'
 
 const CACHE_DIR = process.env.EVS_CACHE_DIR || path.join(process.cwd(), 'cache')
 const ZONES_DIR = path.join(CACHE_DIR, 'zones')
+// Bump when the cached data shape/semantics change so old zone files are ignored
+// (treated as a miss → re-scanned). v2 fixes locale-dependent "Invalid Date" slots.
+const CACHE_VERSION = 2
 
 // ── Keys & files ─────────────────────────────────────────────────────────────────
 
@@ -38,11 +41,13 @@ export function emptySnapshot(): Snapshot {
  * rather than served. Clients never clear the cache; bad data is repaired here.
  */
 export function loadZone(key: string): Snapshot | null {
-  let raw: unknown
+  let raw: { version?: number; snapshot?: unknown }
   try {
     raw = JSON.parse(fs.readFileSync(zoneFile(key), 'utf8'))
   } catch { return null }  // missing or unparseable → miss
-  return sanitizeSnapshot(raw)
+  // Older/incompatible cache format → treat as a miss so it's re-scanned cleanly.
+  if (!raw || raw.version !== CACHE_VERSION) return null
+  return sanitizeSnapshot(raw.snapshot)
 }
 
 const isStr = (x: unknown): x is string => typeof x === 'string'
@@ -83,7 +88,7 @@ export function saveZone(key: string, snap: Snapshot): void {
     fs.mkdirSync(ZONES_DIR, { recursive: true })
     const file = zoneFile(key)
     const tmp = file + '.tmp'
-    fs.writeFileSync(tmp, JSON.stringify(snap))
+    fs.writeFileSync(tmp, JSON.stringify({ version: CACHE_VERSION, snapshot: snap }))
     fs.renameSync(tmp, file)  // atomic replace
   } catch (err) { console.warn('Failed to save zone cache:', (err as Error).message) }
 }

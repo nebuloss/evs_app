@@ -32,6 +32,23 @@ const INJECTED_HEADERS: Record<string, string> = {
   'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
 }
 
+// Local Paris datetime as "YYYY-MM-DDTHH:MM:SS", computed locale-independently.
+// We read the numeric parts rather than relying on a locale string, because
+// small-ICU Node builds (common on appliances) lack the 'sv-SE' locale and would
+// fall back to a US format → "Invalid Date" in the client. en-US + Europe/Paris
+// are always available (tz data ships with ICU).
+const PARIS_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Europe/Paris', hour12: false,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+})
+function parisLocalIso(d: Date): string {
+  const p: Record<string, string> = {}
+  for (const part of PARIS_FMT.formatToParts(d)) p[part.type] = part.value
+  const hour = p.hour === '24' ? '00' : p.hour  // some ICU emit '24' for midnight
+  return `${p.year}-${p.month}-${p.day}T${hour}:${p.minute}:${p.second}`
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────────────
 
 export class EvsHttpError extends Error {
@@ -263,8 +280,7 @@ export async function getTeacherAvailabilities(locationId: string, teacherId: st
   const slots: Slot[] = []
   for (const day of days) {
     for (const s of day.slots ?? []) {
-      const utc = new Date(s.starts_at)
-      const localStr = utc.toLocaleString('sv-SE', { timeZone: 'Europe/Paris' }).replace(' ', 'T')
+      const localStr = parisLocalIso(new Date(s.starts_at))
       slots.push({
         locationId, locationName: pair.locationName, locationLat: pair.locationLat, locationLng: pair.locationLng,
         teacherId, teacherName: pair.teacherName, teacherRating: pair.teacherRating, teacherAutomaticCar: pair.teacherAutomaticCar,
