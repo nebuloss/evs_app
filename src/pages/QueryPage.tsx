@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { Search, MapPin, Heart, Clock, Star, Circle as CircleIcon, ChevronDown, X } from 'lucide-react'
+import { Search, MapPin, Heart, Clock, Star, Circle as CircleIcon, ChevronDown, X, CalendarDays } from 'lucide-react'
 import LocationMapModal from '@/components/LocationMapModal'
 import WishlistSlotModal from '@/components/WishlistSlotModal'
 import FetchProgress, { type ProgressState } from '@/components/FetchProgress'
@@ -489,33 +489,45 @@ export default function QueryPage() {
             <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-600 p-10 text-center text-sm text-slate-500 dark:text-slate-400">No slots match your filters.</div>
           ) : (
             <>
-              <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 divide-y divide-slate-100 dark:divide-slate-700">
-                {visibleGroups.map(day => (
-                  <div key={day.date}>
-                    <div className="px-4 py-2 bg-slate-50 dark:bg-slate-700/50 border-b border-slate-100 dark:border-slate-700">
-                      <h3 className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest capitalize">{day.label}</h3>
-                    </div>
-                    {day.teacherGroups.map((tg, i) => (
-                      <div key={tg.teacherId} className={cn('px-4 py-3', i < day.teacherGroups.length - 1 && 'border-b border-slate-100 dark:border-slate-700')}>
-                        <div className="flex items-center gap-2 mb-2 flex-wrap">
-                          <span className="font-medium text-sm text-slate-800 dark:text-slate-200">{tg.teacherName}</span>
-                          {tg.teacherRating > 0 && <span className="text-xs text-amber-500">{'★'.repeat(Math.round(tg.teacherRating))} {tg.teacherRating.toFixed(1)}</span>}
-                          <span className="text-slate-200 dark:text-slate-600">·</span>
-                          <button onClick={() => setMapLocation({ name: tg.locationName, lat: tg.locationLat, lng: tg.locationLng })}
-                            className="flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors">
-                            <MapPin size={11} />{tg.locationName}
-                          </button>
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          {tg.slots.map(slot => (
-                            <SlotPill key={slot.startsAtUtc} slot={slot} wishlisted={inWishlist(wishlistKey(slot))}
-                              onClick={() => setSelectedSlot({ slot, dateLabel: day.label })} />
-                          ))}
-                        </div>
+              <div className="space-y-4">
+                {visibleGroups.map(day => {
+                  const dayCount = day.teacherGroups.reduce((n, tg) => n + tg.slots.length, 0)
+                  return (
+                    <div key={day.date} className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-sm">
+                      {/* Prominent day header — sticks under the topbar while scrolling a long list */}
+                      <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-t-2xl bg-indigo-600 px-4 py-2.5 text-white">
+                        <h3 className="flex items-center gap-2 text-sm font-bold tracking-wide first-letter:uppercase">
+                          <CalendarDays size={15} className="shrink-0 opacity-80" />
+                          {day.label}
+                        </h3>
+                        <span className="shrink-0 rounded-full bg-white/20 px-2 py-0.5 text-[11px] font-semibold tabular-nums">
+                          {dayCount} slot{dayCount > 1 ? 's' : ''}
+                        </span>
                       </div>
-                    ))}
-                  </div>
-                ))}
+                      <div className="divide-y divide-slate-100 dark:divide-slate-700">
+                        {day.teacherGroups.map(tg => (
+                          <div key={tg.teacherId} className="px-4 py-3">
+                            <div className="flex items-center gap-2 mb-2 flex-wrap">
+                              <span className="font-medium text-sm text-slate-800 dark:text-slate-200">{tg.teacherName}</span>
+                              {tg.teacherRating > 0 && <span className="text-xs text-amber-500">{'★'.repeat(Math.round(tg.teacherRating))} {tg.teacherRating.toFixed(1)}</span>}
+                              <span className="text-slate-200 dark:text-slate-600">·</span>
+                              <button onClick={() => setMapLocation({ name: tg.locationName, lat: tg.locationLat, lng: tg.locationLng })}
+                                className="flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors">
+                                <MapPin size={11} />{tg.locationName}
+                              </button>
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {tg.slots.map(slot => (
+                                <SlotPill key={slot.startsAtUtc} slot={slot} wishlisted={inWishlist(wishlistKey(slot))}
+                                  onClick={() => setSelectedSlot({ slot, dateLabel: day.label })} />
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
               {hiddenDays > 0 && (
                 <button onClick={() => setQs({ visibleDays: qs.visibleDays + PAGE_SIZE })}
