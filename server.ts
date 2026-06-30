@@ -18,6 +18,9 @@ import https from 'https'
 import http from 'http'
 import path from 'path'
 import { URL } from 'url'
+import { getZoneSlots, type ProgressEvent } from './server/search'
+import { clearAllZones } from './server/cache-store'
+import type { Gearbox } from './src/core/types'
 
 const app = express()
 app.set('trust proxy', 1)
@@ -135,6 +138,63 @@ app.get('/geocode', async (req, res) => {
       }
     })
   }).on('error', () => res.json([]))
+})
+
+// ── Shared slot cache API ────────────────────────────────────────────────────
+// These endpoints do the expensive EVS discovery + slot fetching server-side with
+// a shared anonymous session and cache, so every client gets results fast.
+
+function parseScanParams(req: express.Request): { lat: number; lng: number; radiusKm: number; gearbox: Gearbox; ttlMin: number } | null {
+  const lat = Number(req.query.lat)
+  const lng = Number(req.query.lng)
+  const radiusKm = Math.min(50, Math.max(1, Number(req.query.radius)))
+  const gearbox: Gearbox = req.query.gearbox === 'bva' ? 'bva' : 'bvm'
+  const ttlMin = Math.max(0, Number(req.query.ttl ?? 60))
+  if (!isFinite(lat) || !isFinite(lng) || !isFinite(radiusKm)) return null
+  return { lat, lng, radiusKm, gearbox, ttlMin }
+}
+
+// Streaming search with live progress (Server-Sent Events).
+app.get('/api/slots/stream', async (req, res) => {
+  const params = parseScanParams(req)
+  if (!params) return void res.status(400).json({ error: 'Invalid lat/lng/radius' })
+
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders?.()
+
+  let closed = false
+  req.on('close', () => { closed = true })
+  const send = (event: string, data: unknown): void => {
+    if (!closed) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  }
+
+  try {
+    const result = await getZoneSlots(params, (ev: ProgressEvent) => send('progress', ev))
+    send('result', result)
+  } catch (err) {
+    send('error', { message: (err as Error).message })
+  } finally {
+    if (!closed) res.end()
+  }
+})
+
+// Non-streaming fallback.
+app.get('/api/slots', async (req, res) => {
+  const params = parseScanParams(req)
+  if (!params) return void res.status(400).json({ error: 'Invalid lat/lng/radius' })
+  try {
+    const result = await getZoneSlots(params, () => {})
+    res.json(result)
+  } catch (err) {
+    res.status(502).json({ error: (err as Error).message })
+  }
+})
+
+// Clear the shared server cache.
+app.post('/api/cache/clear', (_req, res) => {
+  res.json({ cleared: clearAllZones() })
 })
 
 // Serve built SPA (production)
