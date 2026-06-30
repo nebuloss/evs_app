@@ -15,11 +15,14 @@ function Stars({ rating }: { rating: number }) {
 }
 
 export default function SlotCard({ slot }: Props) {
-  const start = new Date(slot.startsAtLocal)
-  const dateStr = start.toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' })
-  const startTime = start.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  // Format from startsAtUtc (always a valid UTC ISO) in the browser's full-ICU
+  // Europe/Paris — immune to server locale builds and stale startsAtLocal.
+  const tz = { timeZone: 'Europe/Paris' } as const
+  const start = new Date(slot.startsAtUtc)
+  const dateStr = start.toLocaleDateString('fr-FR', { ...tz, weekday: 'short', day: 'numeric', month: 'short' })
+  const startTime = start.toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
   const endMs = start.getTime() + slot.durationMinutes * 60_000
-  const endTime = new Date(endMs).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  const endTime = new Date(endMs).toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
 
   return (
     <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 p-4 hover:border-indigo-300 dark:hover:border-indigo-700 hover:shadow-sm transition-all flex flex-col gap-3">

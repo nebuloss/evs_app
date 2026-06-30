@@ -13,11 +13,13 @@ interface Props {
 export default function BookingModal({ slot, onConfirm, onCancel, booking, error }: Props) {
   useEscapeKey(onCancel, !booking)
   useEnterKey(onConfirm, !booking)
-  const start = new Date(slot.startsAtLocal)
-  const dateStr = start.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' })
-  const startTime = start.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  // Format from startsAtUtc (always valid) in the browser's Europe/Paris.
+  const tz = { timeZone: 'Europe/Paris' } as const
+  const start = new Date(slot.startsAtUtc)
+  const dateStr = start.toLocaleDateString('fr-FR', { ...tz, weekday: 'long', day: 'numeric', month: 'long' })
+  const startTime = start.toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
   const endMs = start.getTime() + slot.durationMinutes * 60_000
-  const endTime = new Date(endMs).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  const endTime = new Date(endMs).toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">

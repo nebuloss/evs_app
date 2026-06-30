@@ -18,9 +18,11 @@ export default function WishlistSlotModal({ slot, dateLabel, wishlisted, onAdd, 
   // Enter triggers the primary action: add if not yet wishlisted, close if already saved.
   useEnterKey(wishlisted ? onClose : () => { onAdd(); onClose() })
 
-  const start = new Date(slot.startsAtLocal)
-  const startTime = start.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
-  const endTime = new Date(start.getTime() + slot.durationMinutes * 60_000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  // Format from startsAtUtc (always valid) in the browser's Europe/Paris.
+  const tz = { timeZone: 'Europe/Paris' } as const
+  const start = new Date(slot.startsAtUtc)
+  const startTime = start.toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
+  const endTime = new Date(start.getTime() + slot.durationMinutes * 60_000).toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
   const credits = slot.durationMinutes / 60
 
   return (

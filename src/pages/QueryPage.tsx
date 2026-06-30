@@ -64,6 +64,15 @@ const DAY_FULL = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 // ── Grouping ──────────────────────────────────────────────────────────────────
 
+// Display is derived from startsAtUtc (a valid UTC ISO string, always present)
+// using the BROWSER's timezone formatting — browsers always ship full ICU, so
+// this is immune to the server's locale build and to any stale-cached
+// startsAtLocal. Europe/Paris is the booking timezone.
+const PARIS_TZ = 'Europe/Paris'
+const parisDateKey = (utc: string): string => new Date(utc).toLocaleDateString('en-CA', { timeZone: PARIS_TZ })       // "YYYY-MM-DD"
+const parisDayLabel = (utc: string): string => new Date(utc).toLocaleDateString('fr-FR', { timeZone: PARIS_TZ, weekday: 'long', day: 'numeric', month: 'long' })
+const parisTime = (utc: string): string => new Date(utc).toLocaleTimeString('fr-FR', { timeZone: PARIS_TZ, hour: '2-digit', minute: '2-digit' })
+
 interface TeacherGroup {
   teacherId: string; teacherName: string; teacherRating: number
   locationName: string; locationLat: number; locationLng: number; slots: Slot[]
@@ -71,11 +80,12 @@ interface TeacherGroup {
 interface DayGroup { date: string; label: string; teacherGroups: TeacherGroup[] }
 
 function groupSlots(slots: Slot[]): DayGroup[] {
-  const sorted = [...slots].sort((a, b) => a.startsAtLocal.localeCompare(b.startsAtLocal))
+  const sorted = [...slots].sort((a, b) => a.startsAtUtc.localeCompare(b.startsAtUtc))
   const byDate = new Map<string, Map<string, TeacherGroup>>()
+  const sampleUtc = new Map<string, string>()  // a representative instant per date for the label
   for (const s of sorted) {
-    const date = s.startsAtLocal.slice(0, 10)
-    if (!byDate.has(date)) byDate.set(date, new Map())
+    const date = parisDateKey(s.startsAtUtc)
+    if (!byDate.has(date)) { byDate.set(date, new Map()); sampleUtc.set(date, s.startsAtUtc) }
     const byTeacher = byDate.get(date)!
     if (!byTeacher.has(s.teacherId)) {
       byTeacher.set(s.teacherId, {
@@ -87,15 +97,15 @@ function groupSlots(slots: Slot[]): DayGroup[] {
   }
   return [...byDate.entries()].map(([date, byTeacher]) => ({
     date,
-    label: new Date(date + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }),
+    label: parisDayLabel(sampleUtc.get(date)!),
     teacherGroups: [...byTeacher.values()],
   }))
 }
 
 function SlotPill({ slot, wishlisted, onClick }: { slot: Slot; wishlisted: boolean; onClick: () => void }) {
-  const start = new Date(slot.startsAtLocal)
-  const startTime = start.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
-  const endTime = new Date(start.getTime() + slot.durationMinutes * 60_000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  const startTime = parisTime(slot.startsAtUtc)
+  const endUtc = new Date(new Date(slot.startsAtUtc).getTime() + slot.durationMinutes * 60_000).toISOString()
+  const endTime = parisTime(endUtc)
   return (
     <button
       onClick={onClick}
@@ -498,7 +508,7 @@ export default function QueryPage() {
                         </div>
                         <div className="flex flex-wrap gap-1.5">
                           {tg.slots.map(slot => (
-                            <SlotPill key={slot.startsAtLocal} slot={slot} wishlisted={inWishlist(wishlistKey(slot))}
+                            <SlotPill key={slot.startsAtUtc} slot={slot} wishlisted={inWishlist(wishlistKey(slot))}
                               onClick={() => setSelectedSlot({ slot, dateLabel: day.label })} />
                           ))}
                         </div>
