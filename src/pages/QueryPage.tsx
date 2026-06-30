@@ -505,12 +505,12 @@ export default function QueryPage() {
     runQuery(override)
   }
 
-  // Auto-fit the radius to the picked place's extent (city vs address); the user
-  // can still adjust the slider afterwards and re-search.
+  // Picking a place only sets the location (and auto-fits the radius to its
+  // extent). The search runs when the user presses Search — picking alone must
+  // not trigger a query.
   const onPickLocation = (g: GeoPoint, suggestedRadius: number | null) => {
     const radiusKm = suggestedRadius ?? qs.radiusKm
     setQs({ place: g, radiusKm })
-    runQuery({ place: g, radiusKm })
   }
 
   const dayGroups = qs.results ? groupSlots(qs.results) : []
