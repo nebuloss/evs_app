@@ -1,7 +1,13 @@
 #!/bin/sh
-# EVS App — install/deploy script
-# Usage: curl -fsSL <raw-url>/install.sh | bash
-#        or: GIT_REPO=https://github.com/you/evs-app.git bash install.sh
+# EVS App — install / update script (idempotent: same command does both)
+#
+# First run installs everything; re-running updates an existing appliance to the
+# latest release (it skips Node/user/service setup that's already in place,
+# swaps in the new build, refreshes deps, and restarts the service).
+#
+# Usage (run as root on the appliance):
+#   curl -fsSL https://raw.githubusercontent.com/nebuloss/evs_app/master/install.sh | sh
+# Override defaults via env: APP_DIR, APP_USER, APP_PORT, NODE_VERSION
 #
 # Supported systems: Alpine Linux (OpenRC), Debian/Ubuntu/Raspbian (systemd)
 # Requires: root (or sudo)
@@ -38,43 +44,43 @@ detect_os() {
 OS=$(detect_os)
 info "Detected OS: $OS"
 
-# ── Install system packages ───────────────────────────────────────────────────
-install_packages_alpine() {
-    info "Installing packages (Alpine)…"
-    apk update -q
-    apk add --no-cache curl ca-certificates
-
-    # Node.js: Alpine 3.19+ ships Node 20, 3.20+ ships Node 22
-    ALPINE_VER=$(cat /etc/alpine-release | cut -d. -f1,2)
-    # Try to install node matching desired major version
+# ── Install system packages (idempotent — skips Node if already present) ─────────
+install_node_alpine() {
+    # Alpine 3.19+ ships Node 20, 3.20+ ships Node 22
     if apk info -q nodejs 2>/dev/null | grep -q "^nodejs-${NODE_VERSION}"; then
         apk add --no-cache "nodejs-${NODE_VERSION}" npm
     else
         apk add --no-cache nodejs npm
     fi
-
-    NODE_ACTUAL=$(node --version 2>/dev/null || echo "none")
-    info "Node.js installed: $NODE_ACTUAL"
 }
 
-install_packages_debian() {
-    info "Installing packages (Debian/Ubuntu)…"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq curl ca-certificates
-
+install_node_debian() {
     # NodeSource — installs requested major version
     info "Installing Node.js ${NODE_VERSION}.x via NodeSource…"
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - >/dev/null 2>&1
     apt-get install -y -qq nodejs
-    NODE_ACTUAL=$(node --version 2>/dev/null || echo "none")
-    info "Node.js installed: $NODE_ACTUAL"
 }
 
-case "$OS" in
-    alpine) install_packages_alpine ;;
-    debian) install_packages_debian ;;
-esac
+ensure_packages() {
+    info "Ensuring base packages…"
+    case "$OS" in
+        alpine) apk update -q; apk add --no-cache curl ca-certificates ;;
+        debian) export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y -qq curl ca-certificates ;;
+    esac
+
+    # Re-running to update? Don't reinstall Node if a usable one is already here.
+    if command -v node >/dev/null 2>&1; then
+        info "Node.js already installed: $(node --version) — skipping"
+    else
+        case "$OS" in
+            alpine) install_node_alpine ;;
+            debian) install_node_debian ;;
+        esac
+        info "Node.js installed: $(node --version 2>/dev/null || echo none)"
+    fi
+}
+
+ensure_packages
 
 # ── Create app user ───────────────────────────────────────────────────────────
 if ! id "$APP_USER" >/dev/null 2>&1; then
@@ -86,6 +92,14 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
 fi
 
 # ── Download pre-built release ────────────────────────────────────────────────
+if [ -d "$APP_DIR/dist-server" ]; then
+    info "Existing installation found in $APP_DIR — updating to latest release"
+    # Stop the running service before swapping files (re-started below).
+    rc-service "$SERVICE_NAME" stop 2>/dev/null || systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+else
+    info "Fresh installation into $APP_DIR"
+fi
+
 RELEASE_URL="https://github.com/nebuloss/evs_app/releases/latest/download/evs-app.tar.gz"
 info "Downloading latest release…"
 rm -rf "$APP_DIR/dist" "$APP_DIR/dist-server"
