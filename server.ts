@@ -19,7 +19,6 @@ import http from 'http'
 import path from 'path'
 import { URL } from 'url'
 import { getZoneSlots, type ProgressEvent } from './server/search'
-import { clearAllZones } from './server/cache-store'
 import type { Gearbox } from './src/core/types'
 
 const app = express()
@@ -190,11 +189,6 @@ app.get('/api/slots', async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: (err as Error).message })
   }
-})
-
-// Clear the shared server cache.
-app.post('/api/cache/clear', (_req, res) => {
-  res.json({ cleared: clearAllZones() })
 })
 
 // Serve built SPA (production)

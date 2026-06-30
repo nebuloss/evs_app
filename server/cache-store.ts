@@ -31,10 +31,51 @@ export function emptySnapshot(): Snapshot {
   return { structureFetchedAt: null, pairs: [], slots: [] }
 }
 
+/**
+ * Loads and SANITIZES a zone snapshot. The cache self-heals: malformed JSON or a
+ * structurally-broken file is treated as a miss (→ re-scan), and individual
+ * corrupt pairs/slots and orphan slots (whose pair no longer exists) are dropped
+ * rather than served. Clients never clear the cache; bad data is repaired here.
+ */
 export function loadZone(key: string): Snapshot | null {
+  let raw: unknown
   try {
-    return JSON.parse(fs.readFileSync(zoneFile(key), 'utf8')) as Snapshot
-  } catch { return null }
+    raw = JSON.parse(fs.readFileSync(zoneFile(key), 'utf8'))
+  } catch { return null }  // missing or unparseable → miss
+  return sanitizeSnapshot(raw)
+}
+
+const isStr = (x: unknown): x is string => typeof x === 'string'
+const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
+
+function validPair(p: any): p is PairMeta {
+  return !!p && isStr(p.locationId) && isStr(p.teacherId) && isStr(p.locationName) &&
+    isNum(p.locationLat) && isNum(p.locationLng) && isStr(p.teacherName) &&
+    isNum(p.teacherRating) && typeof p.teacherAutomaticCar === 'boolean' &&
+    (p.slotsFetchedAt === null || isStr(p.slotsFetchedAt))
+}
+
+function validSlot(s: any): s is Slot {
+  return !!s && isStr(s.locationId) && isStr(s.teacherId) && isStr(s.locationName) &&
+    isNum(s.locationLat) && isNum(s.locationLng) && isStr(s.teacherName) && isNum(s.teacherRating) &&
+    (s.gearboxType === 'bvm' || s.gearboxType === 'bva') &&
+    isStr(s.startsAtLocal) && isStr(s.startsAtUtc) && isNum(s.durationMinutes) && isStr(s.bookingUrl)
+}
+
+/** Returns a cleaned snapshot, or null if the file is too broken to trust. */
+export function sanitizeSnapshot(raw: unknown): Snapshot | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const sfa = o.structureFetchedAt
+  if (!(sfa === null || sfa === undefined || isStr(sfa))) return null  // core field corrupt → miss
+
+  const pairs: PairMeta[] = Array.isArray(o.pairs) ? (o.pairs as unknown[]).filter(validPair) : []
+  let slots: Slot[] = Array.isArray(o.slots) ? (o.slots as unknown[]).filter(validSlot) : []
+  // Drop orphan slots whose (location, teacher) pair is no longer in the structure.
+  const pairKeys = new Set(pairs.map(p => `${p.locationId}:${p.teacherId}`))
+  slots = slots.filter(s => pairKeys.has(`${s.locationId}:${s.teacherId}`))
+
+  return { structureFetchedAt: isStr(sfa) ? sfa : null, pairs, slots }
 }
 
 export function saveZone(key: string, snap: Snapshot): void {
@@ -45,17 +86,6 @@ export function saveZone(key: string, snap: Snapshot): void {
     fs.writeFileSync(tmp, JSON.stringify(snap))
     fs.renameSync(tmp, file)  // atomic replace
   } catch (err) { console.warn('Failed to save zone cache:', (err as Error).message) }
-}
-
-/** Clears all cached zones. Returns the number of zone files removed. */
-export function clearAllZones(): number {
-  let n = 0
-  try {
-    for (const f of fs.readdirSync(ZONES_DIR)) {
-      if (f.endsWith('.json')) { fs.rmSync(path.join(ZONES_DIR, f)); n++ }
-    }
-  } catch { /* dir may not exist yet */ }
-  return n
 }
 
 // ── Staleness & mutations (ported from the old client snapshot.ts) ───────────────
