@@ -1,8 +1,9 @@
 /* Minimal service worker — enough to make the app installable (PWA) and give
- * basic offline shell caching. API calls (/proxy, /geocode) are never cached. */
-// Bump this on any change to cached assets/manifest so old caches are purged
-// on activate (otherwise a stale manifest/icon can block PWA install).
-const CACHE = 'evs-shell-v2'
+ * basic offline shell caching. Dynamic traffic (/api, /proxy, /geocode) is
+ * NEVER cached — only the static app shell is. */
+// Bump this on any change to cached assets/manifest so old caches are purged on
+// activate (v3: stop caching /api responses, which served stale slot data).
+const CACHE = 'evs-shell-v3'
 
 self.addEventListener('install', () => self.skipWaiting())
 
@@ -18,8 +19,8 @@ self.addEventListener('fetch', event => {
   if (request.method !== 'GET') return
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
-  // Never cache API/auth/geocode traffic — always go to network.
-  if (url.pathname.startsWith('/proxy') || url.pathname.startsWith('/geocode')) return
+  // Never cache dynamic API traffic (slots, proxy, geocode) — always go to network.
+  if (url.pathname.startsWith('/api') || url.pathname.startsWith('/proxy') || url.pathname.startsWith('/geocode')) return
   // Always fetch the manifest fresh so icon/manifest changes apply immediately
   // (a cached manifest can otherwise block or stale the PWA install).
   if (url.pathname === '/manifest.webmanifest') return
