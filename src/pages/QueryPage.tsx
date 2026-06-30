@@ -4,32 +4,23 @@ import LocationMapModal from '@/components/LocationMapModal'
 import WishlistSlotModal from '@/components/WishlistSlotModal'
 import FetchProgress, { type ProgressState } from '@/components/FetchProgress'
 import {
-  useAccounts, useWishlist, useSettings, wishlistKey,
+  useWishlist, useSettings, wishlistKey,
   loadRecents, saveRecents, loadLastSearch, saveLastSearch,
-  type Account, type RecentSearch,
+  type RecentSearch,
 } from '@/store/config'
 import { useQueryState, type GeoPoint } from '@/store/queryState'
-import { evsClient, EvsHttpError } from '@/api/evs'
-import { contains, type SearchPlace } from '@/core/geo'
+import { type SearchPlace } from '@/core/geo'
 import { applySearch } from '@/core/search'
 import { type TimeSpec } from '@/core/time'
-import {
-  loadSnapshot, saveSnapshot, emptySnapshot,
-  evictPastSlots, stalePairs, structureIsStale,
-  updateStructure, replacePairSlots,
-  type PairMeta, type Slot,
-} from '@/core/snapshot'
-import { cn, mapLimit } from '@/lib/utils'
+import { type Slot } from '@/core/types'
+import { cn } from '@/lib/utils'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Cache key for a search zone. Coordinates are rounded to 5 decimals (~1 m) so
-// re-searching the same place reliably hits the same cached snapshot instead of
-// missing on insignificant floating-point differences.
-function zoneKey(p: GeoPoint, radiusKm: number): string {
-  return `${p.lat.toFixed(5)},${p.lng.toFixed(5)},${radiusKm}`
-}
 function toSearchPlace(p: GeoPoint, radiusKm: number): SearchPlace { return { name: p.name, lat: p.lat, lng: p.lng, radiusKm } }
+
+/** Result payload from the server's /api/slots[/stream] endpoint. */
+interface SlotsResult { slots: Slot[]; structureFetchedAt: string | null; cached: boolean }
 
 /** Builds a TimeSpec from inline day/window state, or null when nothing is constrained. */
 function buildTimeSpec(days: number[], anyTime: boolean, tStart: string, tEnd: string): TimeSpec | null {
@@ -224,15 +215,11 @@ const PAGE_SIZE = 5
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function QueryPage() {
-  const { accounts, activeAccount: account, addAccount, removeAccount } = useAccounts()
   const { add: addToWishlist, remove: removeFromWishlist, has: inWishlist } = useWishlist()
   const { cacheTtlMin } = useSettings()
   const { state: qs, setState: setQs } = useQueryState()
 
   const [running, setRunning] = useState(false)
-  const [anonError, setAnonError] = useState<string | null>(null)
-  // Name of a real account whose session expired — shows a "sign in again" prompt.
-  const [sessionExpired, setSessionExpired] = useState<string | null>(null)
   const [progress, setProgress] = useState<ProgressState>({ phase: 'idle', message: '', current: 0, total: 0 })
   const [recents, setRecents] = useState<RecentSearch[]>(() => loadRecents())
   const [mapLocation, setMapLocation] = useState<{ name: string; lat: number; lng: number } | null>(null)
@@ -241,241 +228,88 @@ export default function QueryPage() {
   // Full slot set from the last fetch, kept so rating/day/time filters re-apply instantly (no refetch).
   const lastSlotsRef = useRef<Slot[] | null>(null)
   const didInit = useRef(false)
-  // Cancellation token for the in-flight search (cooperative: stops issuing new requests).
-  const cancelRef = useRef<{ cancelled: boolean } | null>(null)
+  // Aborts the in-flight search stream (the server keeps scanning to warm the cache).
+  const abortRef = useRef<AbortController | null>(null)
 
   const cancelSearch = useCallback(() => {
-    if (cancelRef.current) cancelRef.current.cancelled = true
+    abortRef.current?.abort()
+    abortRef.current = null
     setRunning(false)
     setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
   }, [])
 
+  // Search runs server-side now: one streamed request to /api/slots/stream. The
+  // server does the shared, cached discovery + slot fetching with its own
+  // anonymous session; the client just renders progress and filters the result.
   const runQuery = useCallback(async (override: Partial<typeof qs> = {}) => {
     const s = { ...qs, ...override }
     const place = s.place
     if (!place) return
 
-    const token = { cancelled: false }
-    cancelRef.current = token
-    const stopped = () => token.cancelled
-
-    // Pick a candidate account (active, else a stored anonymous one). We don't
-    // register here — authentication below re-signs-in with stored credentials on
-    // token expiry, and only registers a new anonymous account as a last resort.
-    let fetchAccount: Account | null = account ?? accounts.find(a => a.anonymous) ?? null
+    abortRef.current?.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
 
     setRunning(true)
-    setProgress({ phase: 'evict', message: 'Preparing cache…', current: 0, total: 0 })
+    setProgress({ phase: 'structure', message: 'Connecting…', current: 0, total: 0 })
     setQs({ error: null, results: null, snapshotInfo: null, visibleDays: PAGE_SIZE })
 
-    const radius = s.radiusKm
-    const searchPlace = toSearchPlace(place, radius)
-    const key = zoneKey(place, radius)
-
-    try {
-      // Count genuine backend failures (not expected 404s) so a wholly-failed
-      // search reports an error instead of silently showing "0 slots".
-      const isReal = (err: unknown) => !(err instanceof EvsHttpError && err.status === 404)
-      // Set when a real account's token is rejected mid-search (401) — surfaced as a
-      // "session expired" prompt rather than a generic failure.
-      let unauthorized = false
-
-      // Anonymous: transparently re-sign-in with stored credentials on token expiry.
-      const authWith = async (acc: Account): Promise<boolean> => {
-        evsClient.loadAccountTokens(acc.name)
-        try { await evsClient.ensureAuth(acc.email, acc.password); return true }
-        catch { return false }
-      }
-
-      let authed = false
-      if (fetchAccount && !fetchAccount.anonymous) {
-        // Real account: behave like a normal website — if the session has expired,
-        // ask the user to sign in again (or log out) instead of silently refreshing.
-        evsClient.loadAccountTokens(fetchAccount.name)
-        evsClient.setSilentReauth(false)
-        if (evsClient.isExpired()) {
-          setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
-          setSessionExpired(fetchAccount.name)
-          return
-        }
-        authed = true
-      } else if (fetchAccount) {
-        evsClient.setSilentReauth(true)
-        authed = await authWith(fetchAccount)
-      }
-      if (token.cancelled) return
-      // Last resort: register a fresh anonymous account only when there's no
-      // account at all, or a stored anonymous one's credentials no longer work.
-      // A real account is never silently replaced.
-      if (!authed && (!fetchAccount || fetchAccount.anonymous)) {
-        evsClient.setSilentReauth(true)
-        try {
-          evsClient.loadAccountTokens('__anon_tmp__')
-          const reg = await evsClient.registerAnonymous()
-          const anon: Account = { name: 'Anonymous', email: reg.email, password: reg.password, studentId: reg.studentId, anonymous: true }
-          addAccount(anon)
-          fetchAccount = anon
-          // Re-sign-in so tokens are stored under the account name (registration
-          // tokens aren't accepted on data endpoints).
-          authed = await authWith(anon)
-        } catch (err) { if (token.cancelled) return; setAnonError((err as Error).message); return }
-      }
-      if (token.cancelled) return
-      if (!authed || !fetchAccount) throw new Error('Sign-in failed — please try again.')
-
-      let snapshot = (await loadSnapshot(key)) ?? emptySnapshot()
-      evictPastSlots(snapshot)
-
-      // Re-discover if the structure is stale OR empty — an empty cached structure
-      // (e.g. saved by an older buggy run) would otherwise skip discovery forever.
-      if (structureIsStale(snapshot, 24) || snapshot.pairs.length === 0) {
-        setProgress({ phase: 'structure', message: 'Scanning area…', current: 0, total: 0 })
-        const { points, failures } = await evsClient.discoverMeetingPoints(
-          { lat: place.lat, lng: place.lng }, radius, s.gearbox,
-          found => setProgress({ phase: 'structure', message: `Scanning area… ${found} meeting point(s)`, current: 0, total: 0 }),
-          stopped,
-        )
-        if (token.cancelled) return
-        // If the area scan found nothing yet calls were failing, the backend is
-        // unreachable / auth is rejected — surface it rather than "no slots".
-        if (points.length === 0 && failures > 0) {
-          throw new Error(`Couldn't reach EVS to scan the area (${failures} request${failures > 1 ? 's' : ''} failed). Check your connection, or clear the cache in Settings and retry.`)
-        }
-        const inRadius = points.filter(p => contains(searchPlace, p) && p.nextAvailability !== null)
-
-        let loaded = 0
-        let teacherFailures = 0
-        const teacherLists = await mapLimit(inRadius, 16, async point => {
-          if (token.cancelled) return { point, teachers: [] }
-          // A failed teacher fetch (404/transient) for one point must not abort the
-          // whole search — skip that point and keep going.
-          let teachers: Awaited<ReturnType<typeof evsClient.getLocationTeachers>> = []
-          try {
-            teachers = await evsClient.getLocationTeachers(point.id, s.gearbox)
-          } catch (err) {
-            if (err instanceof EvsHttpError && err.status === 401) unauthorized = true
-            else if (isReal(err)) teacherFailures++
-          }
-          loaded++
-          setProgress({ phase: 'structure', message: `Loading teachers… ${loaded}/${inRadius.length} locations`, current: loaded, total: inRadius.length })
-          return { point, teachers }
-        })
-        if (token.cancelled) return
-        const discovered: PairMeta[] = []
-        for (const { point, teachers } of teacherLists) {
-          for (const t of teachers) {
-            discovered.push({
-              locationId: point.id, locationName: point.name,
-              locationLat: point.lat, locationLng: point.lng,
-              teacherId: t.id, teacherName: t.firstName,
-              teacherRating: t.rating, teacherAutomaticCar: t.automaticCar,
-              slotsFetchedAt: null,
-            })
-          }
-        }
-        // Real account's token was rejected (401) — prompt to sign in again.
-        if (unauthorized && fetchAccount && !fetchAccount.anonymous) {
-          setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
-          setSessionExpired(fetchAccount.name)
-          return
-        }
-        // Found points but couldn't load any teachers, and calls were failing —
-        // that's a backend/auth failure, not an empty area.
-        if (inRadius.length > 0 && discovered.length === 0 && teacherFailures > 0) {
-          throw new Error(`Couldn't load teachers — ${teacherFailures} request(s) failed (backend or sign-in error). Try again, or clear the cache in Settings.`)
-        }
-        updateStructure(snapshot, discovered, new Date())
-        await saveSnapshot(key, snapshot)
-      }
-
-      // Slot freshness governed by the user's cache-expiration setting (0 = always refetch).
-      const ttlHours = cacheTtlMin / 60
-      const stale = [...stalePairs(snapshot, ttlHours)]
-      let fetched = 0
-      let slotFailures = 0
-      const now = new Date()
-      await mapLimit(stale, 16, async pairKey => {
-        if (token.cancelled) return
-        const [locId, teacherId] = pairKey.split(':')
-        const pair = snapshot.pairs.find(p => p.locationId === locId && p.teacherId === teacherId)
-        if (!pair) return
-        // The EVS slots endpoint returns 404 for teachers with no bookable
-        // availability — that's expected, not a failure. Treat any error as
-        // "no slots" and cache it so one bad pair can't abort the whole search.
-        let slots: Slot[] = []
-        try {
-          slots = await evsClient.getTeacherAvailabilities(locId, teacherId, s.gearbox, pair)
-        } catch (err) {
-          if (err instanceof EvsHttpError && err.status === 401) unauthorized = true
-          else if (isReal(err)) slotFailures++
-        }
-        replacePairSlots(snapshot, locId, teacherId, slots, now)
-        fetched++
-        setProgress({ phase: 'slots', message: 'Fetching slots…', current: fetched, total: stale.length })
-      })
-      if (token.cancelled) return
-      // Real account's token was rejected (401) — prompt to sign in again.
-      if (unauthorized && fetchAccount && !fetchAccount.anonymous) {
-        setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
-        setSessionExpired(fetchAccount.name)
-        return
-      }
-      // Every slot fetch failed (e.g. auth rejected) — don't cache an empty result
-      // or pretend there are no slots; tell the user the backend calls failed.
-      if (stale.length > 0 && slotFailures === stale.length) {
-        throw new Error(`Couldn't load slots — all ${stale.length} request(s) failed (backend or sign-in error). Try again, or clear the cache in Settings.`)
-      }
-      if (stale.length) await saveSnapshot(key, snapshot)
-
-      lastSlotsRef.current = snapshot.slots
+    const applyResult = (data: SlotsResult): void => {
+      lastSlotsRef.current = data.slots
       const timeSpec = buildTimeSpec(s.days, s.anyTime, s.tStart, s.tEnd)
-      const filtered = applySearch({ place: searchPlace, time: timeSpec, gearbox: s.gearbox, minRating: s.minRating }, snapshot.slots)
+      const filtered = applySearch({ place: toSearchPlace(place, s.radiusKm), time: timeSpec, gearbox: s.gearbox, minRating: s.minRating }, data.slots)
       setProgress({ phase: 'done', message: `Found ${filtered.length} slot(s).`, current: 0, total: 0 })
-      setQs({ results: filtered, snapshotInfo: { slots: snapshot.slots.length, fetchedAt: snapshot.structureFetchedAt } })
+      setQs({ results: filtered, snapshotInfo: { slots: data.slots.length, fetchedAt: data.structureFetchedAt } })
 
       const rec: RecentSearch = {
-        place: { name: place.name, lat: place.lat, lng: place.lng, radius_km: radius },
+        place: { name: place.name, lat: place.lat, lng: place.lng, radius_km: s.radiusKm },
         gearbox: s.gearbox, minRating: s.minRating, days: s.days, anyTime: s.anyTime, tStart: s.tStart, tEnd: s.tEnd,
       }
       saveLastSearch(rec)
       const next = [rec, ...recents.filter(r => !(r.place.name === rec.place.name && r.place.radius_km === rec.place.radius_km))].slice(0, 8)
       saveRecents(next); setRecents(next)
+    }
+
+    const params = new URLSearchParams({
+      lat: String(place.lat), lng: String(place.lng), radius: String(s.radiusKm),
+      gearbox: s.gearbox, ttl: String(cacheTtlMin),
+    })
+
+    try {
+      const resp = await fetch(`/api/slots/stream?${params}`, { signal: ac.signal, headers: { Accept: 'text/event-stream' } })
+      if (!resp.ok || !resp.body) throw new Error(`Search failed (HTTP ${resp.status}).`)
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      let finished = false
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        // SSE frames are separated by a blank line.
+        let sep: number
+        while ((sep = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, sep); buf = buf.slice(sep + 2)
+          let event = 'message'; let dataStr = ''
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('event:')) event = line.slice(6).trim()
+            else if (line.startsWith('data:')) dataStr += line.slice(5).trim()
+          }
+          if (!dataStr) continue
+          if (event === 'progress') { try { setProgress(JSON.parse(dataStr) as ProgressState) } catch { /* ignore */ } }
+          else if (event === 'result') { finished = true; applyResult(JSON.parse(dataStr) as SlotsResult) }
+          else if (event === 'error') { throw new Error((JSON.parse(dataStr) as { message?: string }).message || 'Search failed.') }
+        }
+      }
+      if (!finished) throw new Error('Search ended unexpectedly. Please try again.')
     } catch (err) {
-      if (token.cancelled) return  // user cancelled — not a real error
+      if (ac.signal.aborted) return  // user cancelled — not a real error
       setProgress({ phase: 'idle', message: '', current: 0, total: 0 })
       setQs({ error: (err as Error).message })
     } finally {
-      // Only the still-active run clears the loading state (a newer/cancelled run owns it now).
-      if (cancelRef.current === token && !token.cancelled) setRunning(false)
+      if (abortRef.current === ac) { abortRef.current = null; setRunning(false) }
     }
-  }, [qs, account, accounts, addAccount, setQs, cacheTtlMin, recents])
-
-  // "Sign in again" from the session-expired prompt: re-authenticate the real
-  // account with its stored credentials, then re-run the search.
-  const handleResignIn = useCallback(async () => {
-    const name = sessionExpired
-    setSessionExpired(null)
-    const acc = accounts.find(a => a.name === name)
-    if (!acc) return
-    try {
-      evsClient.loadAccountTokens(acc.name)
-      evsClient.setSilentReauth(false)
-      await evsClient.signIn(acc.email, acc.password)
-      runQuery()
-    } catch {
-      setSessionExpired(name)  // still failing — show the prompt again
-    }
-  }, [sessionExpired, accounts, runQuery])
-
-  // "Log out" from the session-expired prompt: clear the account's session.
-  const handleLogoutExpired = useCallback(() => {
-    const name = sessionExpired
-    setSessionExpired(null)
-    if (!name) return
-    evsClient.loadAccountTokens(name)
-    evsClient.clearTokens()
-    removeAccount(name)
-  }, [sessionExpired, removeAccount])
+  }, [qs, setQs, cacheTtlMin, recents])
 
   // Restore last search on first mount (filters only; user taps Search or a recent chip to run).
   useEffect(() => {
@@ -697,38 +531,6 @@ export default function QueryPage() {
         />
       )}
       {mapLocation && <LocationMapModal name={mapLocation.name} lat={mapLocation.lat} lng={mapLocation.lng} onClose={() => setMapLocation(null)} />}
-      {anonError && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setAnonError(null)} />
-          <div className="relative bg-white dark:bg-slate-800 rounded-2xl shadow-xl w-full max-w-sm mx-4 p-6 space-y-4">
-            <p className="font-semibold text-slate-900 dark:text-slate-100">Could not start session</p>
-            <p className="text-sm text-slate-500 dark:text-slate-400">Failed to create a temporary session to fetch slots. Check your connection and try again.</p>
-            <p className="text-xs text-red-600 dark:text-red-400 font-mono">{anonError}</p>
-            <button onClick={() => setAnonError(null)} className="w-full rounded-xl bg-indigo-600 hover:bg-indigo-700 py-2.5 text-sm font-semibold text-white">Close</button>
-          </div>
-        </div>
-      )}
-      {sessionExpired && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setSessionExpired(null)} />
-          <div className="relative bg-white dark:bg-slate-800 rounded-2xl shadow-xl w-full max-w-sm mx-4 p-6 space-y-4">
-            <p className="font-semibold text-slate-900 dark:text-slate-100">Session expired</p>
-            <p className="text-sm text-slate-500 dark:text-slate-400">
-              Your session for <span className="font-medium text-slate-700 dark:text-slate-300">{sessionExpired}</span> has expired. Sign in again to continue, or log out.
-            </p>
-            <div className="flex gap-3 pt-1">
-              <button onClick={handleLogoutExpired}
-                className="flex-1 rounded-xl border border-slate-200 dark:border-slate-600 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">
-                Log out
-              </button>
-              <button onClick={handleResignIn}
-                className="flex-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 py-2.5 text-sm font-semibold text-white transition-colors">
-                Sign in again
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

@@ -15,9 +15,7 @@
  * before any request to load the right account's tokens into the client.
  */
 
-import type { Gearbox } from '@/core/search'
-import type { PairMeta, Slot } from '@/core/snapshot'
-import { haversineKm, type Point } from '@/core/geo'
+import type { Slot } from '@/core/snapshot'
 
 // ── Errors ──────────────────────────────────────────────────────────────────────
 
@@ -44,24 +42,6 @@ export interface AuthTokens {
 }
 
 // ── API response types ────────────────────────────────────────────────────────
-
-export interface MeetingPoint {
-  id: string
-  name: string
-  lat: number
-  lng: number
-  /** ISO datetime of the next free slot, or null if the point has no upcoming
-   *  availability. Null points are skipped before fetching teachers/slots. */
-  nextAvailability: string | null
-}
-
-export interface Teacher {
-  id: string
-  firstName: string
-  automaticCar: boolean
-  rating: number
-  nbRating: number
-}
 
 export interface StudentProfile {
   id: string
@@ -152,18 +132,6 @@ function extractTokens(headers: Headers): AuthTokens | null {
   return { authorization, accessToken, client, uid, expiry: parseInt(expiry, 10), tokenType }
 }
 
-// ── Random helpers for anonymous registration ─────────────────────────────────
-
-function randStr(len = 8): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz'
-  return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
-}
-
-function randPhone(): string {
-  const digits = Array.from({ length: 8 }, () => Math.floor(Math.random() * 10)).join('')
-  return `06${digits}`
-}
-
 // ── EVSClient ─────────────────────────────────────────────────────────────────
 
 export class EVSClient {
@@ -174,14 +142,6 @@ export class EVSClient {
   private creds: { email: string; password: string } | null = null
   // Shared in-flight re-auth, so a burst of concurrent 401s triggers a single sign-in.
   private reauth: Promise<void> | null = null
-  // Whether a 401 may be recovered transparently. True for anonymous sessions;
-  // false for real accounts, which should be prompted to sign in again instead.
-  private silentReauth = true
-
-  /** Controls whether 401s are recovered transparently (anonymous) or surfaced (real). */
-  setSilentReauth(allow: boolean): void {
-    this.silentReauth = allow
-  }
 
   /**
    * Switches the active account by loading its tokens from localStorage.
@@ -239,7 +199,7 @@ export class EVSClient {
     // locally expired (rotated/invalidated/corrupted). Re-sign-in once and retry —
     // this is what makes a search recover instead of silently returning nothing.
     const isAuthCall = path === '/api/auth' || path === '/api/auth/sign_in'
-    if (res.status === 401 && !isRetry && !isAuthCall && this.creds && this.silentReauth) {
+    if (res.status === 401 && !isRetry && !isAuthCall && this.creds) {
       try {
         await this.ensureReauth()
         return await this.request(method, path, body, true)
@@ -275,208 +235,6 @@ export class EVSClient {
     const data = await res.json() as { data: { id: string } }
     if (!this.tokens) throw new Error('No tokens returned from sign-in')
     return { tokens: this.tokens, studentId: String(data.data.id) }
-  }
-
-  async registerAnonymous(): Promise<{ tokens: AuthTokens; studentId: string; email: string; password: string }> {
-    const email = `${randStr(10)}.${randStr(6)}@evs-anon.local`
-    const password = randStr(16)
-    const res = await this.request('POST', '/api/auth', {
-      email,
-      password,
-      passwordConfirmation: password,
-      additionalData: {
-        first_name: randStr(6),
-        last_name: randStr(6),
-        postal_code_id: 6187,
-        birthday: '1990-01-01',
-        phone: randPhone(),
-        nl_subscribed: false,
-        user_signup_type: 'spa',
-      },
-      confirm_success_url: 'https://app.envoituresimone.com/login/register',
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error((err as { errors?: string[] }).errors?.[0] ?? 'Registration failed')
-    }
-    const data = await res.json() as { data: { id: string } }
-    if (!this.tokens) throw new Error('No tokens returned from registration')
-    this.setCredentials(email, password)
-    return { tokens: this.tokens, studentId: String(data.data.id), email, password }
-  }
-
-  async getMeetingPoints(lat: number, lng: number, gearbox: Gearbox): Promise<MeetingPoint[]> {
-    const qs = new URLSearchParams({ latitude: lat.toString(), longitude: lng.toString(), gearbox_type: gearbox })
-    const res = await this.request('GET', `/api/v3/availabilities?${qs}`)
-    if (!res.ok) throw new EvsHttpError(res.status, 'Failed to get meeting points')
-    const data = await res.json() as { data: Array<{ id: string; name: string; latitude: number; longitude: number; next_availability: string | null }> }
-    return data.data.map(p => ({ id: p.id, name: p.name, lat: p.latitude, lng: p.longitude, nextAvailability: p.next_availability ?? null }))
-  }
-
-  /**
-   * Discovers ALL meeting points within `radiusKm` of `center`.
-   *
-   * Why this is non-trivial: the `/availabilities` endpoint ignores any radius
-   * parameter and only ever returns the ~20 NEAREST points to the queried
-   * coordinate (in dense areas like central Paris those 20 are all within ~4km).
-   * A single query therefore can't cover a 20km radius — searching Paris vs
-   * Clamart (9km apart) returns two completely disjoint sets of 20 points.
-   *
-   * Fix: tile the area with an adaptive quadtree. The crucial property is that
-   * "20 nearest" means a result of 20 points whose farthest is at distance D
-   * guarantees we have EVERY point within D of the query. So each query covers a
-   * disc of radius D; we subdivide a cell only when it hit the 20-cap AND the
-   * cell still extends beyond that coverage. Cells are queried in parallel,
-   * level by level (results dedup by point id). Adapts to density: sparse areas
-   * stop after one query, dense areas subdivide until covered.
-   */
-  async discoverMeetingPoints(
-    center: Point,
-    radiusKm: number,
-    gearbox: Gearbox,
-    onProgress?: (found: number, queries: number) => void,
-    shouldStop?: () => boolean,
-  ): Promise<{ points: MeetingPoint[]; queries: number; truncated: boolean; failures: number }> {
-    const CAP = 20            // backend hard cap on points per query
-    const CONCURRENCY = 16    // measured sweet spot; endpoint throttles past this
-    const MAX_QUERIES = 500   // safety bound on a single discovery
-    const MIN_CELL_KM = 0.4   // stop subdividing below this to avoid runaway recursion
-
-    interface Cell { minLat: number; maxLat: number; minLng: number; maxLng: number }
-    const kmPerDegLat = 111
-    const kmPerDegLng = 111 * Math.cos((center.lat * Math.PI) / 180)
-    const dLat = radiusKm / kmPerDegLat
-    const dLng = radiusKm / kmPerDegLng
-
-    const corners = (c: Cell): Point[] => [
-      { lat: c.minLat, lng: c.minLng }, { lat: c.minLat, lng: c.maxLng },
-      { lat: c.maxLat, lng: c.minLng }, { lat: c.maxLat, lng: c.maxLng },
-    ]
-    const cellCenter = (c: Cell): Point => ({ lat: (c.minLat + c.maxLat) / 2, lng: (c.minLng + c.maxLng) / 2 })
-    // A cell is relevant only if it intersects the search disc.
-    const intersectsDisc = (c: Cell): boolean =>
-      haversineKm(center, cellCenter(c)) <= radiusKm ||
-      corners(c).some(k => haversineKm(center, k) <= radiusKm)
-
-    // Discs we've already fully resolved: every point within `cov` of `q` is known.
-    // A cell whose every corner lies inside one of these discs is redundant — skip it.
-    const covered: Array<{ q: Point; cov: number }> = []
-    const isCovered = (c: Cell): boolean =>
-      covered.some(d => corners(c).every(k => haversineKm(d.q, k) <= d.cov))
-
-    const found = new Map<string, MeetingPoint>()
-    let queries = 0
-    let active = 0
-    let truncated = false
-    let failures = 0
-    const queue: Cell[] = [{ minLat: center.lat - dLat, maxLat: center.lat + dLat, minLng: center.lng - dLng, maxLng: center.lng + dLng }]
-
-    // Continuous work-pool: keep CONCURRENCY queries in flight at all times,
-    // subdividing on the fly — no per-level barrier idle (much faster than BFS).
-    await new Promise<void>(resolve => {
-      const pump = (): void => {
-        // Nothing more can be launched once the queue drains OR we hit the query cap.
-        // Resolve when that's true and all in-flight requests have drained — also on
-        // cancel. (Without the cap check this deadlocks: at MAX_QUERIES with cells still
-        // queued, no new request is launched so finally→pump never fires again.)
-        const exhausted = queue.length === 0 || queries >= MAX_QUERIES
-        if ((exhausted || shouldStop?.()) && active === 0) return resolve()
-        if (shouldStop?.()) return  // cancelled: stop launching; in-flight drains via finally→pump
-        while (active < CONCURRENCY && queue.length > 0 && queries < MAX_QUERIES) {
-          const cell = queue.shift()!
-          if (!intersectsDisc(cell) || isCovered(cell)) continue
-          active++; queries++
-          const q = cellCenter(cell)
-          this.getMeetingPoints(q.lat, q.lng, gearbox).then(pts => {
-            for (const p of pts) found.set(p.id, p)
-            if (pts.length > 0) covered.push({ q, cov: Math.max(...pts.map(p => haversineKm(q, p))) })
-            if (pts.length >= CAP) {
-              const coverage = Math.max(...pts.map(p => haversineKm(q, p)))
-              const halfDiag = Math.max(...corners(cell).map(k => haversineKm(q, k)))
-              if (halfDiag > coverage && halfDiag > MIN_CELL_KM) {
-                const mLat = (cell.minLat + cell.maxLat) / 2
-                const mLng = (cell.minLng + cell.maxLng) / 2
-                queue.push(
-                  { minLat: cell.minLat, maxLat: mLat, minLng: cell.minLng, maxLng: mLng },
-                  { minLat: cell.minLat, maxLat: mLat, minLng: mLng, maxLng: cell.maxLng },
-                  { minLat: mLat, maxLat: cell.maxLat, minLng: cell.minLng, maxLng: mLng },
-                  { minLat: mLat, maxLat: cell.maxLat, minLng: mLng, maxLng: cell.maxLng },
-                )
-              }
-            }
-            onProgress?.(found.size, queries)
-          }).catch(() => { failures++ }).finally(() => { active--; pump() })
-        }
-        if (queries >= MAX_QUERIES && queue.length > 0) truncated = true
-      }
-      pump()
-    })
-
-    return { points: [...found.values()], queries, truncated, failures }
-  }
-
-  async getLocationTeachers(locationId: string, gearbox: Gearbox): Promise<Teacher[]> {
-    const qs = new URLSearchParams({ gearbox_type: gearbox })
-    const res = await this.request('GET', `/api/v3/locations/${locationId}/teachers?${qs}`)
-    if (!res.ok) throw new EvsHttpError(res.status, `Failed to get teachers for location ${locationId}`)
-    const data = await res.json() as {
-      data: {
-        teachers: Array<{
-          id: string
-          first_name: string
-          automatic_car: boolean
-          rating: number
-          nb_rating: number
-        }>
-      }
-    }
-    return data.data.teachers.map(t => ({
-      id: t.id,
-      firstName: t.first_name,
-      automaticCar: t.automatic_car,
-      rating: t.rating,
-      nbRating: t.nb_rating,
-    }))
-  }
-
-  async getTeacherAvailabilities(
-    locationId: string,
-    teacherId: string,
-    gearbox: Gearbox,
-    pair: PairMeta,
-  ): Promise<Slot[]> {
-    const qs = new URLSearchParams({ teacher_id: teacherId, gearbox_type: gearbox })
-    const res = await this.request('GET', `/api/v3/locations/${locationId}/teachers_availabilities?${qs}`)
-    if (!res.ok) throw new EvsHttpError(res.status, `Failed to get availabilities for teacher ${teacherId}`)
-    const data = await res.json() as {
-      data: Array<{ date: string; slots: Array<{ starts_at: string; duration: number }> }>
-    }
-
-    const slots: Slot[] = []
-    for (const day of data.data) {
-      for (const s of day.slots) {
-        const utcDate = new Date(s.starts_at)
-        // 'sv-SE' produces "YYYY-MM-DD HH:MM:SS" in the given timezone — cheapest way
-        // to get a local datetime string without a date library.
-        const localStr = utcDate.toLocaleString('sv-SE', { timeZone: 'Europe/Paris' }).replace(' ', 'T')
-        slots.push({
-          locationId,
-          locationName: pair.locationName,
-          locationLat: pair.locationLat,
-          locationLng: pair.locationLng,
-          teacherId,
-          teacherName: pair.teacherName,
-          teacherRating: pair.teacherRating,
-          teacherAutomaticCar: pair.teacherAutomaticCar,
-          gearboxType: gearbox,
-          startsAtLocal: localStr,
-          startsAtUtc: s.starts_at,
-          durationMinutes: Math.round(s.duration / 60),
-          bookingUrl: buildBookingUrl(locationId, teacherId, s.starts_at, gearbox),
-        })
-      }
-    }
-    return slots
   }
 
   async getStudentProfile(studentId: string): Promise<StudentProfile> {
@@ -599,11 +357,6 @@ export class EVSClient {
     this.tokens = null
     if (this.accountName) localStorage.removeItem(tokenKey(this.accountName))
   }
-}
-
-function buildBookingUrl(locationId: string, teacherId: string, startsAt: string, gearbox: Gearbox): string {
-  const params = new URLSearchParams({ location_id: locationId, teacher_id: teacherId, starts_at: startsAt, gearbox_type: gearbox })
-  return `https://app.envoituresimone.com/booking?${params}`
 }
 
 /**
