@@ -23,7 +23,12 @@ import { cn, mapLimit } from '@/lib/utils'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function zoneKey(p: GeoPoint, radiusKm: number): string { return `${p.lat},${p.lng},${radiusKm}` }
+// Cache key for a search zone. Coordinates are rounded to 5 decimals (~1 m) so
+// re-searching the same place reliably hits the same cached snapshot instead of
+// missing on insignificant floating-point differences.
+function zoneKey(p: GeoPoint, radiusKm: number): string {
+  return `${p.lat.toFixed(5)},${p.lng.toFixed(5)},${radiusKm}`
+}
 function toSearchPlace(p: GeoPoint, radiusKm: number): SearchPlace { return { name: p.name, lat: p.lat, lng: p.lng, radiusKm } }
 
 /** Builds a TimeSpec from inline day/window state, or null when nothing is constrained. */
