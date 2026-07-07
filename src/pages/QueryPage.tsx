@@ -156,6 +156,10 @@ function Popover({ trigger, children, panelClass }: { trigger: React.ReactNode; 
 
 interface GeoCandidate { display_name: string; lat: number; lng: number; place_type: string; boundingbox: number[] | null }
 
+// Session cache of geocode lookups so re-typing the same query is instant and
+// never re-hits the server (which itself caches against Nominatim).
+const geoCache = new Map<string, GeoCandidate[]>()
+
 function LocationSearch({ value, onPick }: { value: string; onPick: (g: GeoPoint, suggestedRadius: number | null) => void }) {
   const [q, setQ] = useState(value)
   const [cands, setCands] = useState<GeoCandidate[]>([])
@@ -167,11 +171,16 @@ function LocationSearch({ value, onPick }: { value: string; onPick: (g: GeoPoint
 
   useEffect(() => {
     if (!open || q.trim().length < 2) { setCands([]); return }
+    const key = q.trim().toLowerCase()
+    const cached = geoCache.get(key)
+    if (cached) { setCands(cached); setLoading(false); return }
     const t = setTimeout(async () => {
       setLoading(true)
       try {
         const r = await fetch('/geocode?q=' + encodeURIComponent(q.trim()))
-        setCands(r.ok ? await r.json() : [])
+        const list = r.ok ? (await r.json() as GeoCandidate[]) : []
+        if (list.length) geoCache.set(key, list)
+        setCands(list)
       } catch { setCands([]) } finally { setLoading(false) }
     }, 350)
     return () => clearTimeout(t)
@@ -285,13 +294,17 @@ export default function QueryPage() {
       gearbox: s.gearbox, ttl: String(cacheTtlMin),
     })
 
-    try {
+    let succeeded = false
+
+    // One streamed attempt. Sets `succeeded` when the result arrives. A server-sent
+    // 'error' event is a real diagnostic (tagged so it isn't retried); a dropped
+    // connection just throws a network error.
+    const attempt = async (): Promise<void> => {
       const resp = await fetch(`/api/slots/stream?${params}`, { signal: ac.signal, headers: { Accept: 'text/event-stream' } })
       if (!resp.ok || !resp.body) throw new Error(`Search failed (HTTP ${resp.status}).`)
       const reader = resp.body.getReader()
       const decoder = new TextDecoder()
       let buf = ''
-      let finished = false
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
@@ -307,11 +320,35 @@ export default function QueryPage() {
           }
           if (!dataStr) continue
           if (event === 'progress') { try { setProgress(JSON.parse(dataStr) as ProgressState) } catch { /* ignore */ } }
-          else if (event === 'result') { finished = true; applyResult(JSON.parse(dataStr) as SlotsResult) }
-          else if (event === 'error') { throw new Error((JSON.parse(dataStr) as { message?: string }).message || 'Search failed.') }
+          else if (event === 'result') { succeeded = true; applyResult(JSON.parse(dataStr) as SlotsResult) }
+          else if (event === 'error') {
+            const e = new Error((JSON.parse(dataStr) as { message?: string }).message || 'Search failed.')
+            e.name = 'ServerError'
+            throw e
+          }
         }
       }
-      if (!finished) throw new Error('Search ended unexpectedly. Please try again.')
+    }
+
+    // The server keeps scanning and caches its work even if this connection drops
+    // (e.g. a mobile browser suspending a backgrounded tab), so a lost stream is
+    // not an error — reconnect and pick up the (now often cached) result.
+    const MAX_ATTEMPTS = 5
+    try {
+      for (let i = 0; i < MAX_ATTEMPTS && !succeeded; i++) {
+        try {
+          await attempt()
+        } catch (err) {
+          if (ac.signal.aborted) return                       // user cancelled
+          if ((err as Error).name === 'ServerError') throw err // real backend error — surface it
+          if (i === MAX_ATTEMPTS - 1) throw err                // out of reconnects
+        }
+        if (!succeeded && !ac.signal.aborted && i < MAX_ATTEMPTS - 1) {
+          setProgress({ phase: 'structure', message: 'Reconnecting…', current: 0, total: 0 })
+          await new Promise(r => setTimeout(r, 400 * (i + 1)))
+        }
+      }
+      if (!succeeded && !ac.signal.aborted) throw new Error('Search could not complete. Please try again.')
     } catch (err) {
       if (ac.signal.aborted) return  // user cancelled — not a real error
       setProgress({ phase: 'idle', message: '', current: 0, total: 0 })

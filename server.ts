@@ -103,11 +103,24 @@ app.use('/proxy', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
   forwardRequest(req, res, `${EVS_BASE}${downstream}`)
 })
 
-// Nominatim geocode: /geocode?q=…
+// Nominatim geocode: /geocode?q=…  Cached in memory: place lookups are stable and
+// Nominatim is rate-limited to 1 req/s, so caching keeps autocomplete fast and polite.
+interface GeoCandidate { display_name: string; lat: number; lng: number; place_type: string; boundingbox: number[] | null }
+const geocodeCache = new Map<string, { at: number; candidates: GeoCandidate[] }>()
+const GEOCODE_TTL_MS = 30 * 24 * 3600_000  // 30 days
+const GEOCODE_MAX = 1000
 let lastNominatimCall = 0
+
 app.get('/geocode', async (req, res) => {
-  const q = req.query.q as string
+  const q = ((req.query.q as string) || '').trim()
   if (!q) return void res.json([])
+  const key = q.toLowerCase()
+
+  const hit = geocodeCache.get(key)
+  if (hit && Date.now() - hit.at < GEOCODE_TTL_MS) {
+    geocodeCache.delete(key); geocodeCache.set(key, hit)  // bump LRU recency
+    return void res.json(hit.candidates)
+  }
 
   // Rate-limit to 1 req/s (Nominatim policy)
   const now = Date.now()
@@ -122,7 +135,7 @@ app.get('/geocode', async (req, res) => {
     upRes.on('end', () => {
       try {
         const raw = JSON.parse(data) as Array<{ display_name: string; lat: string; lon: string; type: string; boundingbox?: [string, string, string, string] }>
-        const candidates = raw.map(r => ({
+        const candidates: GeoCandidate[] = raw.map(r => ({
           display_name: r.display_name,
           lat: parseFloat(r.lat),
           lng: parseFloat(r.lon),
@@ -131,6 +144,14 @@ app.get('/geocode', async (req, res) => {
           // to the place's actual extent (a city vs a single address).
           boundingbox: r.boundingbox ? r.boundingbox.map(parseFloat) : null,
         }))
+        // Only cache non-empty results, so a transient failure/empty response can retry.
+        if (candidates.length) {
+          geocodeCache.set(key, { at: Date.now(), candidates })
+          if (geocodeCache.size > GEOCODE_MAX) {
+            const oldest = geocodeCache.keys().next().value
+            if (oldest !== undefined) geocodeCache.delete(oldest)
+          }
+        }
         res.json(candidates)
       } catch {
         res.json([])

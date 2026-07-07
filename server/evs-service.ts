@@ -265,10 +265,13 @@ export async function getLocationTeachers(locationId: string, gearbox: Gearbox):
   const qs = new URLSearchParams({ gearbox_type: gearbox })
   const res = await session.get(`/api/v3/locations/${locationId}/teachers?${qs}`)
   if (res.status < 200 || res.status >= 300) throw new EvsHttpError(res.status, `Failed to get teachers for location ${locationId}`)
-  const data = JSON.parse(res.body) as { data?: { teachers?: Array<{ id: string; first_name: string; automatic_car: boolean; rating: number; nb_rating: number }> } }
+  const data = JSON.parse(res.body) as { data?: { teachers?: Array<{ id: string; first_name: string | null; automatic_car: boolean; rating: number | null; nb_rating: number | null }> } }
   const teachers = data?.data?.teachers
   if (!Array.isArray(teachers)) return []
-  return teachers.map(t => ({ id: t.id, firstName: t.first_name, automaticCar: t.automatic_car, rating: t.rating, nbRating: t.nb_rating }))
+  const num = (x: unknown): number => (typeof x === 'number' && isFinite(x) ? x : 0)
+  // Teachers with no ratings yet come back with null rating — coerce so slots never
+  // carry null (which would crash the client and be dropped by the cache sanitizer).
+  return teachers.map(t => ({ id: t.id, firstName: t.first_name ?? '', automaticCar: !!t.automatic_car, rating: num(t.rating), nbRating: num(t.nb_rating) }))
 }
 
 export async function getTeacherAvailabilities(locationId: string, teacherId: string, gearbox: Gearbox, pair: PairMeta): Promise<Slot[]> {

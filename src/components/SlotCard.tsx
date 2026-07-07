@@ -4,12 +4,15 @@ interface Props {
   slot: Slot
 }
 
-function Stars({ rating }: { rating: number }) {
-  const full = Math.round(rating)
+function Stars({ rating }: { rating: number | null | undefined }) {
+  // Teachers with no ratings yet come back as null — guard against `.toFixed` on null.
+  const r = typeof rating === 'number' && isFinite(rating) ? rating : 0
+  if (r <= 0) return <span className="text-xs text-slate-400 dark:text-slate-500">No ratings yet</span>
+  const full = Math.max(0, Math.min(5, Math.round(r)))
   return (
-    <span className="text-amber-400 text-sm" title={`${rating.toFixed(1)}/5`}>
+    <span className="text-amber-400 text-sm" title={`${r.toFixed(1)}/5`}>
       {'★'.repeat(full)}{'☆'.repeat(5 - full)}
-      <span className="ml-1 text-slate-500 dark:text-slate-400 text-xs">{rating.toFixed(1)}</span>
+      <span className="ml-1 text-slate-500 dark:text-slate-400 text-xs">{r.toFixed(1)}</span>
     </span>
   )
 }
