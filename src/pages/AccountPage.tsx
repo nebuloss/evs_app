@@ -1,9 +1,9 @@
 import { useState, useCallback } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAccounts, type Account } from '@/store/config'
-import { evsClient, type StudentProfile, type Lesson, type CreditProvision } from '@/api/evs'
+import { evsClient, isSessionExpired, type StudentProfile, type Lesson, type CreditProvision } from '@/api/evs'
 import AccountModal from '@/components/AccountModal'
-import { Trash2, Plus } from 'lucide-react'
+import { Trash2, Plus, LogIn } from 'lucide-react'
 import { useEscapeKey, useEnterKey } from '@/hooks/useKeyShortcuts'
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -33,22 +33,52 @@ function ErrorBox({ message }: { message: string }) {
   )
 }
 
+/**
+ * Renders a query error. An expired session (401 that couldn't be renewed with the
+ * stored password) gets an actionable "sign in again" prompt instead of a raw error,
+ * mirroring how the real EVS site asks you to re-authenticate.
+ */
+function SectionError({ error, onReauth }: { error: unknown; onReauth: () => void }) {
+  if (isSessionExpired(error)) {
+    return (
+      <div className="rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 p-4 space-y-3">
+        <p className="text-sm text-amber-800 dark:text-amber-300">
+          Your session has expired. Please sign in again to view your account.
+        </p>
+        <button
+          onClick={onReauth}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold px-3 py-2 transition-colors"
+        >
+          <LogIn size={14} />
+          Sign in again
+        </button>
+      </div>
+    )
+  }
+  return <ErrorBox message={(error as Error).message} />
+}
+
 async function withAuth<T>(account: Account, fn: () => Promise<T>): Promise<T> {
   evsClient.loadAccountTokens(account.name)
-  if (evsClient.isExpired()) await evsClient.signIn(account.email, account.password)
+  // Always remembers credentials so the request layer can self-heal a server-side
+  // 401, and eagerly re-signs-in when the token is locally expired.
+  await evsClient.ensureAuth(account.email, account.password)
   return fn()
 }
 
-function ProfileSection({ account }: { account: Account }) {
+function ProfileSection({ account, onReauth }: { account: Account; onReauth: () => void }) {
   const { data, isLoading, error } = useQuery<StudentProfile>({
     queryKey: ['profile', account.name, account.studentId],
     queryFn: () => withAuth(account, () => evsClient.getStudentProfile(account.studentId!)),
     staleTime: 5 * 60_000,
     enabled: !!account.studentId,
+    // Don't retry a genuine session-expiry — it just re-hammers sign-in with a
+    // password EVS already rejected. Show the "sign in again" prompt immediately.
+    retry: (count, err) => !isSessionExpired(err) && count < 3,
   })
 
   if (isLoading) return <LoadingRows />
-  if (error) return <ErrorBox message={(error as Error).message} />
+  if (error) return <SectionError error={error} onReauth={onReauth} />
   if (!data) return <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">No profile data.</p>
 
   return (
@@ -112,16 +142,17 @@ function LessonCard({ lesson }: { lesson: Lesson }) {
   )
 }
 
-function LessonsSection({ account }: { account: Account }) {
+function LessonsSection({ account, onReauth }: { account: Account; onReauth: () => void }) {
   const { data, isLoading, error } = useQuery<Lesson[]>({
     queryKey: ['lessons', account.name, account.studentId],
     queryFn: () => withAuth(account, () => evsClient.getLessons(account.studentId!)),
     staleTime: 2 * 60_000,
     enabled: !!account.studentId,
+    retry: (count, err) => !isSessionExpired(err) && count < 3,
   })
 
   if (isLoading) return <LoadingRows />
-  if (error) return <ErrorBox message={(error as Error).message} />
+  if (error) return <SectionError error={error} onReauth={onReauth} />
 
   const upcoming = (data ?? []).filter(l => l.status !== 'cancelled' && new Date(l.startsAt) > new Date())
   const past = (data ?? []).filter(l => l.status === 'cancelled' || new Date(l.startsAt) <= new Date())
@@ -150,16 +181,17 @@ function LessonsSection({ account }: { account: Account }) {
   )
 }
 
-function CreditsSection({ account }: { account: Account }) {
+function CreditsSection({ account, onReauth }: { account: Account; onReauth: () => void }) {
   const { data, isLoading, error } = useQuery<CreditProvision[]>({
     queryKey: ['credits', account.name, account.studentId],
     queryFn: () => withAuth(account, () => evsClient.getCreditsHistory(account.studentId!)),
     staleTime: 5 * 60_000,
     enabled: !!account.studentId,
+    retry: (count, err) => !isSessionExpired(err) && count < 3,
   })
 
   if (isLoading) return <LoadingRows />
-  if (error) return <ErrorBox message={(error as Error).message} />
+  if (error) return <SectionError error={error} onReauth={onReauth} />
   if (!data || data.length === 0) {
     return <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">No credit history.</p>
   }
@@ -198,9 +230,13 @@ function CreditsSection({ account }: { account: Account }) {
 
 export default function AccountPage() {
   const { activeAccount, removeAccount, addAccount } = useAccounts()
+  const queryClient = useQueryClient()
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [accountModalOpen, setAccountModalOpen] = useState(false)
-  const closeModals = useCallback(() => { setConfirmDelete(false); setAccountModalOpen(false) }, [])
+  // Re-auth modal, opened from a "session expired" prompt. Prefilled with the active
+  // account so the user just confirms/updates their password to get a fresh session.
+  const [reauthOpen, setReauthOpen] = useState(false)
+  const closeModals = useCallback(() => { setConfirmDelete(false); setAccountModalOpen(false); setReauthOpen(false) }, [])
   const confirmRemove = useCallback(() => {
     if (!confirmDelete || !activeAccount) return
     removeAccount(activeAccount.name)
@@ -213,6 +249,17 @@ export default function AccountPage() {
     addAccount(a)
     evsClient.loadAccountTokens(a.name)
     setAccountModalOpen(false)
+  }
+
+  // Re-authentication succeeded (AccountEditor re-signs-in and returns a fresh
+  // studentId/tokens): persist the updated account and refetch everything.
+  const saveReauth = (a: Account) => {
+    addAccount(a)
+    evsClient.loadAccountTokens(a.name)
+    setReauthOpen(false)
+    queryClient.invalidateQueries({ queryKey: ['profile', a.name] })
+    queryClient.invalidateQueries({ queryKey: ['lessons', a.name] })
+    queryClient.invalidateQueries({ queryKey: ['credits', a.name] })
   }
 
   if (!activeAccount) {
@@ -258,16 +305,25 @@ export default function AccountPage() {
       </div>
 
       <Section title="👤 Profile">
-        <ProfileSection account={activeAccount} />
+        <ProfileSection account={activeAccount} onReauth={() => setReauthOpen(true)} />
       </Section>
 
       <Section title="📅 Lessons">
-        <LessonsSection account={activeAccount} />
+        <LessonsSection account={activeAccount} onReauth={() => setReauthOpen(true)} />
       </Section>
 
       <Section title="💳 Credits">
-        <CreditsSection account={activeAccount} />
+        <CreditsSection account={activeAccount} onReauth={() => setReauthOpen(true)} />
       </Section>
+
+      {reauthOpen && (
+        <AccountModal
+          title="Sign in again"
+          initial={activeAccount}
+          onSave={saveReauth}
+          onClose={() => setReauthOpen(false)}
+        />
+      )}
 
       {/* Remove account */}
       <div className="rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-900/20 p-5">

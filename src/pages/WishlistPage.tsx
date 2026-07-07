@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import SlotCard from '@/components/SlotCard'
 import BookingModal from '@/components/BookingModal'
 import { useWishlist, useAccounts, wishlistKey } from '@/store/config'
-import { evsClient, type StudentProfile } from '@/api/evs'
+import { evsClient, isSessionExpired, type StudentProfile } from '@/api/evs'
 import type { Slot } from '@/core/snapshot'
 import { cn } from '@/lib/utils'
 
@@ -23,13 +23,15 @@ export default function WishlistPage() {
   const { data: profile } = useQuery<StudentProfile>({
     queryKey: ['profile', activeAccount?.name, studentId],
     queryFn: async () => {
-      // Must load the right account's tokens before each request.
+      // Must load the right account's tokens before each request. ensureAuth also
+      // remembers credentials so a server-side 401 self-heals transparently.
       evsClient.loadAccountTokens(activeAccount!.name)
-      if (evsClient.isExpired()) await evsClient.signIn(activeAccount!.email, activeAccount!.password)
+      await evsClient.ensureAuth(activeAccount!.email, activeAccount!.password)
       return evsClient.getStudentProfile(studentId!)
     },
     enabled: !!studentId && !!activeAccount,
     staleTime: 2 * 60_000,
+    retry: (count, err) => !isSessionExpired(err) && count < 3,
   })
 
   const credits = profile?.credits ?? 0

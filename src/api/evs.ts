@@ -29,6 +29,16 @@ export class EvsHttpError extends Error {
   }
 }
 
+/**
+ * True when an error means the user's session has expired and could not be
+ * renewed automatically (stored password rejected, or token revoked with no
+ * way to recover). Callers use this to prompt the user to sign in again
+ * instead of showing a raw failure.
+ */
+export function isSessionExpired(err: unknown): boolean {
+  return err instanceof EvsHttpError && err.status === 401
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 export interface AuthTokens {
@@ -217,12 +227,17 @@ export class EVSClient {
     return this.tokens.expiry < Date.now() / 1000 + 60
   }
 
-  /** Signs in only if the current tokens are expired; otherwise does nothing. */
-  async ensureAuth(email: string, password: string): Promise<string | null> {
-    // Remember creds even when the token looks valid, so a later 401 can self-heal.
+  /**
+   * Prepares the client for authenticated requests. ALWAYS remembers the
+   * credentials (even when the stored token still looks valid) so the request
+   * layer can transparently re-sign-in on a server-side 401 — a token can be
+   * rotated/revoked by the backend while its local `expiry` still reads valid
+   * (e.g. after it was refreshed on another device/tab). Only performs an eager
+   * sign-in when the token is locally expired, deduped across concurrent callers.
+   */
+  async ensureAuth(email: string, password: string): Promise<void> {
     this.setCredentials(email, password)
-    if (!this.isExpired()) return null
-    return (await this.signIn(email, password)).studentId
+    if (this.isExpired()) await this.ensureReauth()
   }
 
   async signIn(email: string, password: string): Promise<{ tokens: AuthTokens; studentId: string }> {
@@ -230,7 +245,7 @@ export class EVSClient {
     const res = await this.request('POST', '/api/auth/sign_in', { email, password })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      throw new Error((err as { errors?: string[] }).errors?.[0] ?? 'Sign-in failed')
+      throw new EvsHttpError(res.status, (err as { errors?: string[] }).errors?.[0] ?? 'Sign-in failed')
     }
     const data = await res.json() as { data: { id: string } }
     if (!this.tokens) throw new Error('No tokens returned from sign-in')
@@ -239,7 +254,7 @@ export class EVSClient {
 
   async getStudentProfile(studentId: string): Promise<StudentProfile> {
     const res = await this.request('GET', `/api/v1/students/${studentId}`)
-    if (!res.ok) throw new Error('Failed to get student profile')
+    if (!res.ok) throw new EvsHttpError(res.status, 'Failed to get account info')
     const data = await res.json() as {
       data: { id: string; attributes: { first_name: string; last_name: string; email: string; phone: string; credits: number; cdr_status: string } }
     }
@@ -258,7 +273,7 @@ export class EVSClient {
   async getLessons(studentId: string, state?: string): Promise<Lesson[]> {
     const qs = state ? `?state=${encodeURIComponent(state)}` : ''
     const res = await this.request('GET', `/api/v1/account/${studentId}/lessons${qs}`)
-    if (!res.ok) throw new Error('Failed to get lessons')
+    if (!res.ok) throw new EvsHttpError(res.status, 'Failed to get lessons')
     const data = await res.json() as {
       data: Array<{
         id: string
@@ -307,7 +322,7 @@ export class EVSClient {
 
   async getCreditsHistory(studentId: string): Promise<CreditProvision[]> {
     const res = await this.request('GET', `/api/v1/account/${studentId}/credits_provisions_history`)
-    if (!res.ok) throw new Error('Failed to get credits history')
+    if (!res.ok) throw new EvsHttpError(res.status, 'Failed to get credits history')
     const data = await res.json() as {
       data: Array<{
         name: string
