@@ -130,6 +130,51 @@ function loadTokensFor(accountName: string): AuthTokens | null {
   try { return JSON.parse(raw) as AuthTokens } catch { return null }
 }
 
+/**
+ * Best-effort extraction of a human-readable reason from an EVS error response.
+ * The backend is inconsistent about error shape — depending on the endpoint a
+ * failure comes back as `{ errors: ["msg"] }`, `{ errors: { base: ["msg"] } }`
+ * (Rails validation style), `{ errors: [{ detail }] }` (JSON:API), `{ error }`,
+ * `{ message }`, or `{ full_messages }`. We try them all, and if none match we
+ * still surface the HTTP status + a snippet of the body so the reason is never
+ * fully swallowed (which is what left bookings showing only "Booking failed").
+ */
+async function readErrorMessage(res: Response, fallback: string): Promise<string> {
+  let text = ''
+  try { text = await res.text() } catch { /* body unreadable */ }
+  let body: unknown = null
+  if (text) { try { body = JSON.parse(text) } catch { /* not JSON */ } }
+
+  const fromValue = (v: unknown): string | null => {
+    if (typeof v === 'string') return v.trim() || null
+    if (Array.isArray(v)) {
+      const parts = v.map(x =>
+        typeof x === 'string' ? x
+          : x && typeof x === 'object'
+            ? String((x as Record<string, unknown>).detail ?? (x as Record<string, unknown>).message ?? (x as Record<string, unknown>).title ?? '')
+            : '',
+      ).filter(Boolean)
+      return parts.length ? parts.join(' · ') : null
+    }
+    if (v && typeof v === 'object') {
+      // Rails-style { field: ["msg", …] } — flatten the messages across fields.
+      const parts = Object.values(v as Record<string, unknown>).flatMap(x =>
+        Array.isArray(x) ? x.filter((s): s is string => typeof s === 'string')
+          : typeof x === 'string' ? [x] : [])
+      return parts.length ? parts.join(' · ') : null
+    }
+    return null
+  }
+
+  if (body && typeof body === 'object') {
+    const b = body as Record<string, unknown>
+    const msg = fromValue(b.errors) ?? fromValue(b.error) ?? fromValue(b.message) ?? fromValue(b.full_messages)
+    if (msg) return msg
+  }
+  const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 200)
+  return snippet ? `${fallback} (HTTP ${res.status}: ${snippet})` : `${fallback} (HTTP ${res.status})`
+}
+
 /** Extracts the devise-token-auth headers from a response, returning null if any are missing. */
 function extractTokens(headers: Headers): AuthTokens | null {
   const authorization = headers.get('authorization')
@@ -244,8 +289,7 @@ export class EVSClient {
     this.setCredentials(email, password)
     const res = await this.request('POST', '/api/auth/sign_in', { email, password })
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new EvsHttpError(res.status, (err as { errors?: string[] }).errors?.[0] ?? 'Sign-in failed')
+      throw new EvsHttpError(res.status, await readErrorMessage(res, 'Sign-in failed'))
     }
     const data = await res.json() as { data: { id: string } }
     if (!this.tokens) throw new Error('No tokens returned from sign-in')
@@ -359,8 +403,7 @@ export class EVSClient {
       automatic: slot.gearboxType === 'bva',
     })
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error((err as { errors?: string[] }).errors?.[0] ?? 'Booking failed')
+      throw new EvsHttpError(res.status, await readErrorMessage(res, 'Booking failed'))
     }
     const data = await res.json() as { data?: { id?: string } }
     return data.data?.id ?? null

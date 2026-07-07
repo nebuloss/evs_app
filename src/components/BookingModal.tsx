@@ -20,6 +20,8 @@ export default function BookingModal({ slot, onConfirm, onCancel, booking, error
   const startTime = start.toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
   const endMs = start.getTime() + slot.durationMinutes * 60_000
   const endTime = new Date(endMs).toLocaleTimeString('fr-FR', { ...tz, hour: '2-digit', minute: '2-digit' })
+  // Null-safe: slots wishlisted before ratings were coerced to 0 may carry null.
+  const rating = typeof slot.teacherRating === 'number' && isFinite(slot.teacherRating) ? slot.teacherRating : 0
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -45,8 +47,14 @@ export default function BookingModal({ slot, onConfirm, onCancel, booking, error
             </span>
           </div>
           <p className="text-slate-600 dark:text-slate-300">
-            <span className="text-amber-400">{'★'.repeat(Math.round(slot.teacherRating))}</span>
-            <span className="ml-1 text-slate-400 dark:text-slate-500 text-xs">{slot.teacherRating.toFixed(1)}</span>
+            {rating > 0 ? (
+              <>
+                <span className="text-amber-400">{'★'.repeat(Math.round(rating))}</span>
+                <span className="ml-1 text-slate-400 dark:text-slate-500 text-xs">{rating.toFixed(1)}</span>
+              </>
+            ) : (
+              <span className="text-slate-400 dark:text-slate-500 text-xs">No ratings yet</span>
+            )}
           </p>
           <p className="text-slate-600 dark:text-slate-300">📍 {slot.locationName}</p>
           <p className="text-slate-600 dark:text-slate-300">📅 <span className="capitalize">{dateStr}</span></p>
