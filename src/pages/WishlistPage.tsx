@@ -34,7 +34,8 @@ export default function WishlistPage() {
 
   const credits = profile?.credits ?? 0
 
-  const sorted = [...items].sort((a, b) => a.startsAtLocal.localeCompare(b.startsAtLocal))
+  const sorted = [...items].sort((a, b) =>
+    a.startsAtUtc.localeCompare(b.startsAtUtc) || a.durationMinutes - b.durationMinutes)
 
   const handleBook = (slot: Slot) => {
     setBookingSlot(slot)

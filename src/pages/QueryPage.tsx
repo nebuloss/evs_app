@@ -518,7 +518,7 @@ export default function QueryPage() {
                             </div>
                             <div className="flex flex-wrap gap-1.5">
                               {tg.slots.map(slot => (
-                                <SlotPill key={slot.startsAtUtc} slot={slot} wishlisted={inWishlist(wishlistKey(slot))}
+                                <SlotPill key={wishlistKey(slot)} slot={slot} wishlisted={inWishlist(wishlistKey(slot))}
                                   onClick={() => setSelectedSlot({ slot, dateLabel: day.label })} />
                               ))}
                             </div>

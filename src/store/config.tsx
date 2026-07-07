@@ -351,11 +351,17 @@ export function useSettings(): SettingsStore {
 
 // ── Wishlist key helpers ──────────────────────────────────────────────────────
 
-/** Stable identity key for a wishlist slot: `startsAtUtc::teacherId`. */
+/**
+ * Stable identity key for a bookable slot. It MUST include duration (and
+ * location + gearbox): EVS offers e.g. a 1h AND a 2h lesson at the SAME start
+ * time with the SAME teacher, so keying on start+teacher alone collides —
+ * wishlisting the 2h slot would then mark the 1h slot as saved too, and two
+ * list items would share a React key.
+ */
 export type WishlistKey = string
 
 export function wishlistKey(slot: Slot): WishlistKey {
-  return `${slot.startsAtUtc}::${slot.teacherId}`
+  return `${slot.locationId}::${slot.teacherId}::${slot.startsAtUtc}::${slot.durationMinutes}::${slot.gearboxType}`
 }
 
 // ── Recent searches + last search (localStorage; no context needed) ────────────
