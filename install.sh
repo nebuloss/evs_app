@@ -116,6 +116,9 @@ cd "$APP_DIR"
 npm ci --omit=dev --prefer-offline --quiet 2>&1 | tail -3
 
 # ── Set ownership ─────────────────────────────────────────────────────────────
+# Ensure the persistent slot-cache dir exists so it's owned by the app user
+# (preserved across updates; the server writes zones/ under it at runtime).
+mkdir -p "$APP_DIR/cache"
 chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null \
     || chown -R "$APP_USER" "$APP_DIR"
 
@@ -132,6 +135,11 @@ description="EVS Slot Finder App"
 command="$NODE_BIN"
 command_args="$APP_DIR/dist-server/server.js"
 command_user="$APP_USER"
+# Run from APP_DIR so the server's relative cache dir (process.cwd()/cache)
+# resolves to $APP_DIR/cache — otherwise cwd is / and cache writes hit /cache
+# (root-owned → EACCES) and the shared slot cache never persists. systemd sets
+# WorkingDirectory below; OpenRC needs this explicit directory.
+directory="$APP_DIR"
 command_background=yes
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/\${RC_SVCNAME}.log"
