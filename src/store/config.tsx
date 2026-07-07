@@ -221,9 +221,19 @@ function makeWishlistStore() {
     })
   }
 
+  /** Removes every slot matching the predicate in one update (e.g. expired slots). */
+  const removeWhere = (pred: (s: Slot) => boolean) => {
+    setItems(prev => {
+      const next = prev.filter(s => !pred(s))
+      if (next.length === prev.length) return prev  // nothing matched — no write/rerender
+      writeLocal('evs_wishlist', next)
+      return next
+    })
+  }
+
   const has = (key: WishlistKey): boolean => items.some(s => wishlistKey(s) === key)
 
-  return { items, add, remove, has }
+  return { items, add, remove, removeWhere, has }
 }
 
 function makeThemeStore() {
